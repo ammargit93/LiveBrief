@@ -67,6 +67,13 @@ class TimelineResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class PlannerDecision(BaseModel):
+    affected_sections: List[str]
+    entity_types_to_extract: List[str]
+    requires_conflict_check: bool
+    requires_timeline_update: bool
+    reasoning: str
+
 class JobResponse(BaseModel):
     id: UUID
     document_id: UUID
@@ -74,6 +81,7 @@ class JobResponse(BaseModel):
     current_node: str
     status: str
     error: Optional[str]
+    planner_decision: Optional[Dict[str, Any]] = None
     started_at: datetime
     updated_at: datetime
 

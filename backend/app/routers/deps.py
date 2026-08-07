@@ -33,14 +33,19 @@ async def create_workspace_with_sections(name: str, db: AsyncSession) -> Workspa
 
 # Dependency: Get active workspace ID, fallback to "Default Workspace" if none specified
 async def get_active_workspace_id(
-    workspace_id: Optional[uuid.UUID] = Query(None),
+    workspace_id: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db)
 ) -> uuid.UUID:
-    if workspace_id:
-        ws = await db.get(Workspace, workspace_id)
+    if workspace_id and workspace_id not in ("None", "null", "undefined", ""):
+        try:
+            ws_uuid = uuid.UUID(workspace_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid workspace UUID format")
+            
+        ws = await db.get(Workspace, ws_uuid)
         if not ws:
             raise HTTPException(status_code=404, detail="Workspace not found")
-        return workspace_id
+        return ws_uuid
         
     stmt = select(Workspace).where(Workspace.name == "Default Workspace")
     res = await db.execute(stmt)

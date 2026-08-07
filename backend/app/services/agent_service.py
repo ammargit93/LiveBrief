@@ -1,25 +1,47 @@
+import sys
 import json
 import logging
 import asyncio
 from uuid import UUID
 from typing import Dict, Any, List, TypedDict, Tuple
-from openai import OpenAI
+
 from sqlalchemy import select, update, desc
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 from backend.app.core.config import settings
 from backend.app.core.database import async_session_maker
 from backend.app.models import Document, Entity, Embedding, Conflict, Review, ProjectSummary, GraphRun
 from backend.app.services.embedding_service import get_embedding, cosine_similarity
 
 # Logger configuration
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("agent")
+root_logger = logging.getLogger()
+if not root_logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    handler.setFormatter(formatter)
+    root_logger.addHandler(handler)
+root_logger.setLevel(logging.INFO)
 
-# Initialize Groq/OpenAI client
-client = OpenAI(
-    base_url=settings.GROQ_API_BASE,
-    api_key=settings.GROQ_API_KEY
-)
+logger = logging.getLogger("agent")
+logger.setLevel(logging.INFO)
+
+# Helper to call LLM using LangChain ChatGroq
+def call_llm(prompt: str, temperature: float = 0.0, json_mode: bool = False) -> str:
+    from langchain_groq import ChatGroq
+    if json_mode:
+        llm = ChatGroq(
+            model=settings.GROQ_MODEL,
+            groq_api_key=settings.GROQ_API_KEY,
+            temperature=temperature
+        ).bind(response_format={"type": "json_object"})
+    else:
+        llm = ChatGroq(
+            model=settings.GROQ_MODEL,
+            groq_api_key=settings.GROQ_API_KEY,
+            temperature=temperature
+        )
+    response = llm.invoke(prompt)
+    return response.content
 
 class AgentState(TypedDict):
     workspace_id: str
@@ -37,13 +59,17 @@ class AgentState(TypedDict):
     conflicts: List[Dict[str, Any]]
     sections_to_draft: List[str]
     error: str
+    planner_decision: Dict[str, Any]
 
 # Helper to log node transitions
-async def update_job_node(db: AsyncSession, run_id: str, node_name: str, status: str = "running", error: str = None):
+async def update_job_node(db: AsyncSession, run_id: str, node_name: str, status: str = "running", error: str = None, planner_decision: dict = None):
+    values = {"current_node": node_name, "status": status, "error": error}
+    if planner_decision is not None:
+        values["planner_decision"] = planner_decision
     stmt = (
         update(GraphRun)
         .where(GraphRun.id == run_id)
-        .values(current_node=node_name, status=status, error=error)
+        .values(**values)
     )
     await db.execute(stmt)
     await db.commit()
@@ -86,13 +112,8 @@ JSON format:
 """
 
         try:
-            response = client.chat.completions.create(
-                model=settings.GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                response_format={"type": "json_object"}
-            )
-            data = json.loads(response.choices[0].message.content)
+            content = call_llm(prompt, temperature=0.0, json_mode=True)
+            data = json.loads(content)
             
             # Save type & confidence to DB
             stmt = (
@@ -117,6 +138,86 @@ JSON format:
             
     return state
 
+# Node 1.5: Planner Node
+async def planner_node(state: AgentState) -> AgentState:
+    run_id = state["run_id"]
+    logger.info(f"[{run_id}] Starting planner node")
+    
+    async with async_session_maker() as db:
+        await update_job_node(db, run_id, "planner")
+        
+        # 1. Fetch existing project brief section metadata for context
+        stmt = select(ProjectSummary).where(ProjectSummary.workspace_id == state["workspace_id"]).order_by(ProjectSummary.section)
+        res = await db.execute(stmt)
+        summaries = res.scalars().all()
+        
+        summary_meta = []
+        for s in summaries:
+            summary_meta.append(f"- Section '{s.section}': {len(s.content)} characters of content")
+        summary_meta_str = "\n".join(summary_meta) if summary_meta else "No sections drafted yet (this is the first document)."
+        
+        workspace_info = f"Existing Brief Sections in Workspace:\n{summary_meta_str}"
+        
+        # 2. Build the planner prompt
+        prompt = f"""You are the Project Brief Planner. Your job is to plan the processing pipeline for an ingested document.
+Determine which brief sections are affected and which entity categories need to be extracted from this document to update the brief correctly.
+
+Workspace Context:
+{workspace_info}
+
+Document Details:
+- Name: {state["filename"]}
+- Classification Type: {state["type"]}
+
+Document Excerpt (First 6000 characters):
+\"\"\"
+{state["content"][:6000]}
+\"\"\"
+
+Output format:
+You must respond with a raw JSON object matching this schema.
+JSON structure:
+{{
+  "affected_sections": ["Overview", "Architecture", "Major Features", "Current Decisions", "Known Risks", "Pending Decisions", "Open Questions", "Timeline"],
+  "entity_types_to_extract": ["feature", "decision", "component", "risk", "action_item", "deadline", "owner"],
+  "requires_conflict_check": true | false,
+  "requires_timeline_update": true | false,
+  "reasoning": "Brief explanation of the decisions"
+}}
+"""
+        try:
+            content = call_llm(prompt, temperature=0.0, json_mode=True)
+            from backend.app.schemas.schemas import PlannerDecision
+            decision = PlannerDecision.model_validate_json(content)
+            
+            # Save the decision to state and persist in DB
+            state["planner_decision"] = decision.model_dump()
+            await update_job_node(db, run_id, "planner", planner_decision=decision.model_dump())
+            
+        except Exception as e:
+            logger.error(f"[{run_id}] Planner failed, falling back to full pipeline: {e}")
+            from backend.app.schemas.schemas import PlannerDecision
+            fallback_decision = PlannerDecision(
+                affected_sections=[
+                    "Project Overview",
+                    "Architecture",
+                    "Major Features",
+                    "Current Decisions",
+                    "Known Risks",
+                    "Pending Decisions",
+                    "Open Questions",
+                    "Timeline"
+                ],
+                entity_types_to_extract=["feature", "decision", "component", "risk", "action_item", "deadline", "owner"],
+                requires_conflict_check=True,
+                requires_timeline_update=True,
+                reasoning=f"Planner fallback triggered due to error: {str(e)}"
+            )
+            state["planner_decision"] = fallback_decision.model_dump()
+            await update_job_node(db, run_id, "planner", planner_decision=fallback_decision.model_dump())
+            
+    return state
+
 # Node 2: Information Extraction
 async def extraction_node(state: AgentState) -> AgentState:
     run_id = state["run_id"]
@@ -126,11 +227,32 @@ async def extraction_node(state: AgentState) -> AgentState:
     async with async_session_maker() as db:
         await update_job_node(db, run_id, "extraction")
         
+        allowed_types = state["planner_decision"].get("entity_types_to_extract", [])
+        if not allowed_types:
+            logger.info(f"[{run_id}] Skipping extraction node as requested by the plan.")
+            await update_job_node(db, run_id, "extraction", status="complete")
+            return state
+
         chunks = state["chunks"]
         # Process chunks in smaller batches to avoid token per minute (TPM) limit on free tier
         batch_size = 3
         entities_list = []
         
+        category_prompts = {
+            "feature": "- features: name, description, page (integer, based on nearby [Page X] marker if present, default to 1)",
+            "decision": '- technical_decisions: decision, rationale, status ("proposed" | "accepted" | "superseded"), page (integer, based on nearby [Page X] marker if present, default to 1)',
+            "component": "- components: name, description, page (integer, based on nearby [Page X] marker if present, default to 1)",
+            "risk": '- risks: description, severity ("low" | "medium" | "high"), mitigation (or null), page (integer, based on nearby [Page X] marker if present, default to 1)',
+            "action_item": "- action_items: description, owner (or null), due_date (ISO-date or null), page (integer, based on nearby [Page X] marker if present, default to 1)",
+            "deadline": "- deadlines: label, date (ISO-date), page (integer, based on nearby [Page X] marker if present, default to 1)",
+            "owner": "- owners: name, role (or null), area (or null), page (integer, based on nearby [Page X] marker if present, default to 1)"
+        }
+        active_prompts = []
+        for t in allowed_types:
+            if t in category_prompts:
+                active_prompts.append(category_prompts[t])
+        categories_to_extract_str = "\n".join(active_prompts)
+
         try:
             for batch_idx, start_idx in enumerate(range(0, len(chunks), batch_size)):
                 batch_chunks = chunks[start_idx : start_idx + batch_size]
@@ -141,15 +263,11 @@ async def extraction_node(state: AgentState) -> AgentState:
 Document type: {state['type']}
 
 Extract entities for the following categories if they are mentioned in this content:
-- features: name, description
-- technical_decisions: decision, rationale, status ("proposed" | "accepted" | "superseded")
-- components: name, description
-- risks: description, severity ("low" | "medium" | "high"), mitigation (or null)
-- action_items: description, owner (or null), due_date (ISO-date or null)
-- deadlines: label, date (ISO-date)
-- owners: name, role (or null), area (or null)
+{categories_to_extract_str}
 
-For each extracted item, you MUST include a short 'source_excerpt' (maximum one sentence) from the content that directly supports the extraction.
+For each extracted item:
+1. You MUST include a short 'source_excerpt' (maximum one sentence) from the content that directly supports the extraction.
+2. Identify the page number where the information is located based on nearby page markers like `[Page X]` in the content portion. Set the 'page' field (integer) to that number. If there are no page markers, default the page to 1.
 
 Content portion:
 \"\"\"
@@ -159,23 +277,18 @@ Content portion:
 You must respond with a raw JSON object only.
 JSON format:
 {{
-  "features": [{{ "name": "...", "description": "...", "source_excerpt": "..." }}],
-  "technical_decisions": [{{ "decision": "...", "rationale": "...", "status": "proposed|accepted|superseded", "source_excerpt": "..." }}],
-  "components": [{{ "name": "...", "description": "...", "source_excerpt": "..." }}],
-  "risks": [{{ "description": "...", "severity": "low|medium|high", "mitigation": "...", "source_excerpt": "..." }}],
-  "action_items": [{{ "description": "...", "owner": "...", "due_date": "...", "source_excerpt": "..." }}],
-  "deadlines": [{{ "label": "...", "date": "...", "source_excerpt": "..." }}],
-  "owners": [{{ "name": "...", "role": "...", "area": "...", "source_excerpt": "..." }}]
+  "features": [{{ "name": "...", "description": "...", "source_excerpt": "...", "page": 1 }}],
+  "technical_decisions": [{{ "decision": "...", "rationale": "...", "status": "proposed|accepted|superseded", "source_excerpt": "...", "page": 1 }}],
+  "components": [{{ "name": "...", "description": "...", "source_excerpt": "...", "page": 1 }}],
+  "risks": [{{ "description": "...", "severity": "low|medium|high", "mitigation": "...", "source_excerpt": "...", "page": 1 }}],
+  "action_items": [{{ "description": "...", "owner": "...", "due_date": "...", "source_excerpt": "...", "page": 1 }}],
+  "deadlines": [{{ "label": "...", "date": "...", "source_excerpt": "...", "page": 1 }}],
+  "owners": [{{ "name": "...", "role": "...", "area": "...", "source_excerpt": "...", "page": 1 }}]
 }}
 """
 
-                response = client.chat.completions.create(
-                    model=settings.GROQ_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.0,
-                    response_format={"type": "json_object"}
-                )
-                extracted_data = json.loads(response.choices[0].message.content)
+                content = call_llm(prompt, temperature=0.0, json_mode=True)
+                extracted_data = json.loads(content)
                 
                 # Add a brief rate-limiting sleep between batches
                 await asyncio.sleep(2.0)
@@ -192,6 +305,8 @@ JSON format:
                         "owners": "owner"
                     }
                     entity_type = type_map.get(key, key)
+                    if entity_type not in allowed_types:
+                        continue
                     if not isinstance(items, list):
                         continue
                         
@@ -199,6 +314,14 @@ JSON format:
                         if not item:
                             continue
                         source_excerpt = item.pop("source_excerpt", "")
+                        
+                        # Extract and sanitize page
+                        page_val = item.pop("page", 1)
+                        try:
+                            page_num = int(page_val)
+                        except (ValueError, TypeError):
+                            page_num = 1
+                        item["page"] = page_num
                         
                         # Generate embedding for the entity JSON structure to enable pgvector searches
                         val_str = json.dumps(item)
@@ -251,6 +374,12 @@ async def knowledge_merge_node(state: AgentState) -> AgentState:
     async with async_session_maker() as db:
         await update_job_node(db, run_id, "knowledge_merge")
         
+        if not state["planner_decision"].get("requires_conflict_check", True):
+            logger.info(f"[{run_id}] Skipping knowledge merge node as requested by the plan.")
+            await update_job_node(db, run_id, "knowledge_merge", status="complete")
+            state["conflicts"] = []
+            return state
+
         new_entities = state["entities"]
         conflicts_to_check = []
         
@@ -299,6 +428,17 @@ async def conflict_detection_node(state: AgentState) -> AgentState:
     run_id = state["run_id"]
     logger.info(f"[{run_id}] Starting conflict detection node")
     
+    # Mapping categories to sections
+    category_to_sections = {
+        "feature": ["Major Features"],
+        "decision": ["Current Decisions", "Pending Decisions"],
+        "component": ["Architecture"],
+        "risk": ["Known Risks", "Open Questions"],
+        "deadline": ["Timeline"],
+        "owner": ["Project Overview"],
+        "action_item": ["Project Overview", "Timeline"]
+    }
+    
     async with async_session_maker() as db:
         await update_job_node(db, run_id, "conflict_detection")
         
@@ -306,17 +446,20 @@ async def conflict_detection_node(state: AgentState) -> AgentState:
         new_entities = state["entities"]
         detected_conflicts = []
         affected_sections = set()
-        
-        # Mapping categories to sections
-        category_to_sections = {
-            "feature": ["Major Features"],
-            "decision": ["Current Decisions", "Pending Decisions"],
-            "component": ["Architecture"],
-            "risk": ["Known Risks", "Open Questions"],
-            "deadline": ["Timeline"],
-            "owner": ["Project Overview"],
-            "action_item": ["Project Overview", "Timeline"]
-        }
+
+        # Check if the plan requires a conflict check
+        if not state["planner_decision"].get("requires_conflict_check", True) or not candidates:
+            logger.info(f"[{run_id}] Skipping conflict detection node or no candidates found.")
+            await update_job_node(db, run_id, "conflict_detection", status="complete")
+            
+            # If no conflicts checked, default to drafting all sections matching new entity types
+            if not affected_sections:
+                for new_ent in new_entities:
+                    sections = category_to_sections.get(new_ent["type"], [])
+                    for s in sections:
+                        affected_sections.add(s)
+            state["sections_to_draft"] = list(affected_sections)
+            return state
         
         try:
             for item in candidates:
@@ -345,13 +488,8 @@ JSON structure:
   "explanation": "State clearly why Record B contradicts Record A"
 }}
 """
-                response = client.chat.completions.create(
-                    model=settings.GROQ_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.0,
-                    response_format={"type": "json_object"}
-                )
-                audit = json.loads(response.choices[0].message.content)
+                content = call_llm(prompt, temperature=0.0, json_mode=True)
+                audit = json.loads(content)
                 
                 if audit.get("conflict"):
                     db_conflict = Conflict(
@@ -406,6 +544,19 @@ async def generate_brief_updates_node(state: AgentState) -> AgentState:
         
         sections = state["sections_to_draft"]
         
+        # 1. Filter sections based on planner's affected_sections
+        planner_sections = state["planner_decision"].get("affected_sections", [])
+        sections = [s for s in sections if s in planner_sections]
+        
+        # 2. Exclude Timeline if requires_timeline_update is False
+        if not state["planner_decision"].get("requires_timeline_update", True):
+            sections = [s for s in sections if s != "Timeline"]
+            
+        if not sections:
+            logger.info(f"[{run_id}] No sections to draft based on planner decision.")
+            await update_job_node(db, run_id, "generate_brief_updates", status="complete")
+            return state
+        
         try:
             # Load the current document
             doc = await db.get(Document, doc_id)
@@ -434,16 +585,23 @@ async def generate_brief_updates_node(state: AgentState) -> AgentState:
                 ent_types = section_to_entity_types.get(section_name, [])
                 
                 # Fetch both existing active entities and the new ones for this category, isolated by workspace
-                ent_stmt = select(Entity).join(Document).where(Entity.type.in_(ent_types)).where(Document.workspace_id == state["workspace_id"])
+                # Join Document and eager-load it so we can access document name/id in prompt formatting
+                ent_stmt = (
+                    select(Entity)
+                    .options(joinedload(Entity.document))
+                    .join(Document)
+                    .where(Entity.type.in_(ent_types))
+                    .where(Document.workspace_id == state["workspace_id"])
+                )
                 ent_res = await db.execute(ent_stmt)
                 all_entities = ent_res.scalars().all()
                 
                 entities_str = "\n".join([
-                    f"- {ent.type.upper()}: {json.dumps(ent.value)} (from doc_id: {ent.document_id})"
+                    f"- {ent.type.upper()}: {json.dumps(ent.value)} (Source Excerpt: \"{ent.source_excerpt}\", Document Name: '{ent.document.filename}', Document ID: {ent.document.id}, Page: {ent.value.get('page', 1)})"
                     for ent in all_entities
                 ])
                 
-                # Ask LLM to draft the updated section content
+                # Ask LLM to draft the updated section content with strict grounding and citations
                 prompt = f"""You are a professional technical writer and system architect. Update the Section '{section_name}' of our software project brief.
 Here is the current content of Section '{section_name}':
 \"\"\"
@@ -456,18 +614,19 @@ Here are the extracted structured facts and decisions we must incorporate (both 
 \"\"\"
 
 Please draft a clean, professional, and well-structured Markdown version of Section '{section_name}'.
-- Do not add any introductory or concluding comments.
-- Start directly with the updated Markdown content.
-- Do not repeat information redundantly.
-- Keep the style premium, high-level, and clean.
+
+GROUNDING RULES:
+1. Every claim, feature, tech decision, deadline, component, or item you add/update MUST be cited from the source facts.
+2. For every claim, append a clickable citation link exactly in one of the following formats depending on the file:
+   - For PDF documents or documents with a page number, use: Source: [Document Name · Page X](http://localhost:8000/documents/{{doc_id}}/download) where X is the page number from the corresponding 'Page' fact.
+   - For other documents, use: Source: [Document Name](http://localhost:8000/documents/{{doc_id}}/download)
+   Crucial: Do not wrap the citation in parentheses. Output exactly: Source: [Document Name · Page X](...) or Source: [Document Name](...).
+3. STRICT HACK PREVENTION: Do not make up any facts, features, dates, owners, or decisions. If an item is not directly supported by a source fact excerpt, do not include it. Every bullet point or statement must have a citation.
+4. Keep the style premium, high-level, and clean.
+5. Do not add any introductory or concluding comments. Start directly with the updated Markdown content.
 """
                 
-                response = client.chat.completions.create(
-                    model=settings.GROQ_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2
-                )
-                draft_content = response.choices[0].message.content.strip()
+                draft_content = call_llm(prompt, temperature=0.2, json_mode=False).strip()
                 
                 # Add a brief rate-limiting sleep between section drafts
                 await asyncio.sleep(2.0)
@@ -557,11 +716,16 @@ async def run_agent_pipeline(run_id: str):
         "entities": [],
         "conflicts": [],
         "sections_to_draft": [],
-        "error": ""
+        "error": "",
+        "planner_decision": {}
     }
     
     # Execute node state transitions
     state = await classification_node(state)
+    if state.get("error"):
+        return
+        
+    state = await planner_node(state)
     if state.get("error"):
         return
         
@@ -580,5 +744,15 @@ async def run_agent_pipeline(run_id: str):
     state = await generate_brief_updates_node(state)
     if state.get("error"):
         return
+        
+    # Mark document status as complete
+    async with async_session_maker() as db:
+        stmt = (
+            update(Document)
+            .where(Document.id == state["document_id"])
+            .values(status="complete")
+        )
+        await db.execute(stmt)
+        await db.commit()
         
     logger.info(f"[{run_id}] Finished processing up to interrupt stage successfully.")

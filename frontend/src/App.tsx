@@ -14,6 +14,9 @@ const renderMarkdown = (text: string) => {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
   
+  // Links
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer" class="text-indigo-600 hover:text-indigo-900 underline font-medium">$1</a>');
+  
   // Headers
   html = html.replace(/^### (.*$)/gim, '<h4 class="text-xs font-bold text-slate-800 mt-2 mb-1">$1</h4>');
   html = html.replace(/^## (.*$)/gim, '<h3 class="text-sm font-bold text-slate-900 mt-3 mb-2">$1</h3>');
@@ -28,7 +31,7 @@ const renderMarkdown = (text: string) => {
   
   // Paragraphs / Linebreaks
   html = html.split('\n\n').map(p => {
-    if (p.trim().startsWith('<h') || p.trim().startsWith('<li') || p.trim().startsWith('<ul')) {
+    if (p.trim().startsWith('<h') || p.trim().startsWith('<li') || p.trim().startsWith('<ul') || p.trim().startsWith('<a')) {
       return p;
     }
     return `<p class="text-slate-700 text-xs leading-relaxed mb-2.5">${p.replace(/\n/g, '<br/>')}</p>`;
@@ -40,7 +43,9 @@ const renderMarkdown = (text: string) => {
 export default function App() {
   const [activeTab, setActiveTab] = useState('brief');
   const [workspaces, setWorkspaces] = useState<any[]>([]);
-  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string>('');
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string>(() => {
+    return localStorage.getItem('activeWorkspaceId') || '';
+  });
   
   const [documents, setDocuments] = useState<any[]>([]);
   const [briefSections, setBriefSections] = useState<any[]>([]);
@@ -60,10 +65,21 @@ export default function App() {
   const [showWorkspaceModal, setShowWorkspaceModal] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState('');
 
+  const [viewingDoc, setViewingDoc] = useState<any | null>(null);
+  const [viewingDocContent, setViewingDocContent] = useState<string>('');
+  const [loadingDocContent, setLoadingDocContent] = useState(false);
+
   // Initial workspaces fetch
   useEffect(() => {
     fetchWorkspaces();
   }, []);
+
+  // Sync activeWorkspaceId to localStorage
+  useEffect(() => {
+    if (activeWorkspaceId) {
+      localStorage.setItem('activeWorkspaceId', activeWorkspaceId);
+    }
+  }, [activeWorkspaceId]);
 
   // Fetch workspaces list
   const fetchWorkspaces = async () => {
@@ -72,14 +88,39 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setWorkspaces(data);
-        if (data.length > 0 && !activeWorkspaceId) {
-          // Default to Default Workspace if it exists, otherwise first one
-          const defaultWs = data.find((w: any) => w.name === 'Default Workspace') || data[0];
-          setActiveWorkspaceId(defaultWs.id);
+        if (data.length > 0) {
+          const storedId = localStorage.getItem('activeWorkspaceId');
+          const exists = data.some((w: any) => w.id === storedId);
+          if (exists) {
+            setActiveWorkspaceId(storedId!);
+          } else {
+            const defaultWs = data.find((w: any) => w.name === 'Default Workspace') || data[0];
+            setActiveWorkspaceId(defaultWs.id);
+          }
         }
       }
     } catch (e) {
       console.error("Error fetching workspaces:", e);
+    }
+  };
+
+  const handleViewDocument = async (doc: any) => {
+    setViewingDoc(doc);
+    setViewingDocContent('');
+    setLoadingDocContent(true);
+    try {
+      const res = await fetch(`${API_BASE}/documents/${doc.id}/content?workspace_id=${activeWorkspaceId}`);
+      if (res.ok) {
+        const data = await res.json();
+        setViewingDocContent(data.content || 'No content found in this document.');
+      } else {
+        setViewingDocContent('Failed to retrieve document content.');
+      }
+    } catch (error) {
+      console.error("Error loading document content:", error);
+      setViewingDocContent('Error loading document content.');
+    } finally {
+      setLoadingDocContent(false);
     }
   };
 
@@ -723,7 +764,14 @@ export default function App() {
                     <tbody className="divide-y divide-slate-200">
                       {documents.map((doc) => (
                         <tr key={doc.id} className="hover:bg-slate-50 transition-all">
-                          <td className="px-4 py-3 font-semibold text-slate-900">{doc.filename}</td>
+                           <td className="px-4 py-3 font-semibold text-slate-900">
+                            <span 
+                              onClick={() => handleViewDocument(doc)}
+                              className="text-indigo-600 hover:text-indigo-900 hover:underline cursor-pointer font-medium"
+                            >
+                              {doc.filename}
+                            </span>
+                          </td>
                           <td className="px-4 py-3 font-mono text-[10px]">v{doc.version}</td>
                           <td className="px-4 py-3">{doc.type || 'Unknown'}</td>
                           <td className="px-4 py-3 font-mono text-[10px]">
@@ -801,11 +849,13 @@ export default function App() {
                           {steps.map((step, idx) => {
                             const isCompleted = idx < currentNodeIndex || (idx === currentNodeIndex && job.status === 'complete');
                             const isCurrent = idx === currentNodeIndex && job.status === 'running';
-                            const isWaiting = idx > currentNodeIndex;
+                            const isWaiting = idx > currentNodeIndex && job.status !== 'waiting_for_review';
+                            const isPendingReview = idx === currentNodeIndex && job.status === 'waiting_for_review';
 
                             let stepStyle = "border-slate-200 text-slate-400 bg-white";
                             if (isCompleted) stepStyle = "border-green-300 text-green-700 bg-green-50/50";
                             if (isCurrent) stepStyle = "border-blue-400 text-blue-700 bg-blue-50 font-bold";
+                            if (isPendingReview) stepStyle = "border-orange-300 text-orange-700 bg-orange-50 font-semibold";
 
                             return (
                               <div key={step.id} className={`p-2 border text-center text-[10px] rounded-none ${stepStyle}`}>
@@ -813,6 +863,7 @@ export default function App() {
                                 <div className="text-[8px] mt-0.5 font-normal">
                                   {isCompleted && "✓ Finished"}
                                   {isCurrent && "Processing..."}
+                                  {isPendingReview && "Pending Review"}
                                   {isWaiting && "Waiting"}
                                 </div>
                               </div>
@@ -954,6 +1005,63 @@ export default function App() {
               </button>
             </div>
           </form>
+        </div>
+      )}
+
+      {/* Document Viewer Modal */}
+      {viewingDoc && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 w-full max-w-4xl max-h-[85vh] flex flex-col rounded-none shadow-xl">
+            {/* Modal Header */}
+            <div className="flex justify-between items-center px-6 py-4 border-b border-slate-200">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900 font-mono tracking-tight">{viewingDoc.filename}</h3>
+                <p className="text-[10px] text-slate-400 mt-0.5">
+                  Type: <span className="font-semibold">{viewingDoc.type || 'Unknown'}</span> | Version: <span className="font-semibold">v{viewingDoc.version}</span>
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                <a
+                  href={`${API_BASE}/documents/${viewingDoc.id}/download?workspace_id=${activeWorkspaceId}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[10px] font-bold uppercase tracking-wider border border-slate-200 bg-slate-50 text-slate-700 px-3 py-1.5 hover:bg-slate-100 transition-all"
+                >
+                  Download File
+                </a>
+                <button
+                  onClick={() => setViewingDoc(null)}
+                  className="text-slate-400 hover:text-slate-600 text-sm font-bold px-2 py-1"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-6 overflow-y-auto flex-1 bg-slate-50 font-sans text-xs text-slate-800 whitespace-pre-wrap leading-relaxed max-h-[60vh]">
+              {loadingDocContent ? (
+                <div className="flex flex-col items-center justify-center py-20 space-y-3">
+                  <div className="w-6 h-6 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
+                  <span className="text-[10px] uppercase font-bold tracking-widest text-slate-400">Parsing and Loading Document Text...</span>
+                </div>
+              ) : (
+                <div className="bg-white border border-slate-200 p-6 font-mono text-[11px] leading-relaxed shadow-sm overflow-x-auto text-slate-700 select-text">
+                  {viewingDocContent}
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="px-6 py-3 border-t border-slate-200 flex justify-end bg-white">
+              <button
+                onClick={() => setViewingDoc(null)}
+                className="text-[10px] font-bold uppercase tracking-wider bg-slate-900 text-white px-4 py-2 hover:bg-slate-800 transition-all rounded-none"
+              >
+                Close Viewer
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

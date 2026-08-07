@@ -10,10 +10,10 @@ def parse_markdown(file_path: str) -> str:
 def parse_pdf(file_path: str) -> str:
     reader = pypdf.PdfReader(file_path)
     text_parts = []
-    for page in reader.pages:
+    for idx, page in enumerate(reader.pages):
         text = page.extract_text()
         if text:
-            text_parts.append(text)
+            text_parts.append(f"[Page {idx + 1}]\n{text}")
     return "\n\n".join(text_parts)
 
 def parse_docx(file_path: str) -> str:

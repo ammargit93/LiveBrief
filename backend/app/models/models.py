@@ -116,6 +116,7 @@ class GraphRun(Base):
     current_node = Column(String(100), nullable=False, default="upload")
     status = Column(String(50), nullable=False, default="running")
     error = Column(Text, nullable=True)
+    planner_decision = Column(JSONB, nullable=True)
     started_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

@@ -3,6 +3,7 @@ import uuid
 import logging
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, BackgroundTasks
+from fastapi.responses import FileResponse
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.core.config import settings
@@ -26,6 +27,7 @@ async def upload_documents(
     os.makedirs(upload_dir, exist_ok=True)
     
     saved_docs = []
+    run_ids = []
     batch_id = uuid.uuid4()
     
     for upload_file in files:
@@ -73,6 +75,7 @@ async def upload_documents(
         )
         db.add(db_run)
         await db.flush()
+        run_ids.append(db_run.id)
         
         # Log timeline event
         db_timeline = Timeline(
@@ -84,10 +87,12 @@ async def upload_documents(
         )
         db.add(db_timeline)
         
-        # Queue background processing run
-        background_tasks.add_task(run_agent_pipeline, db_run.id)
-        
     await db.commit()
+    
+    # Queue background processing runs only after db commit completes
+    for rid in run_ids:
+        background_tasks.add_task(run_agent_pipeline, str(rid))
+        
     return saved_docs
 
 @router.get("", response_model=List[DocumentResponse])
@@ -117,3 +122,39 @@ async def get_document(
     if not db_doc or db_doc.workspace_id != workspace_id:
         raise HTTPException(status_code=404, detail="Document not found in this workspace")
     return db_doc
+
+@router.get("/{id}/download")
+async def download_document(
+    id: uuid.UUID,
+    workspace_id: uuid.UUID = Depends(get_active_workspace_id),
+    db: AsyncSession = Depends(get_db)
+):
+    db_doc = await db.get(Document, id)
+    if not db_doc or db_doc.workspace_id != workspace_id:
+        raise HTTPException(status_code=404, detail="Document not found in this workspace")
+    if not os.path.exists(db_doc.storage_path):
+        raise HTTPException(status_code=404, detail="Document file not found on disk")
+    return FileResponse(
+        db_doc.storage_path,
+        filename=db_doc.filename,
+        media_type="application/octet-stream"
+    )
+
+@router.get("/{id}/content")
+async def get_document_content(
+    id: uuid.UUID,
+    workspace_id: uuid.UUID = Depends(get_active_workspace_id),
+    db: AsyncSession = Depends(get_db)
+):
+    db_doc = await db.get(Document, id)
+    if not db_doc or db_doc.workspace_id != workspace_id:
+        raise HTTPException(status_code=404, detail="Document not found in this workspace")
+    if not os.path.exists(db_doc.storage_path):
+        raise HTTPException(status_code=404, detail="Document file not found on disk")
+        
+    try:
+        from backend.app.services.parser_service import extract_text_and_type
+        content, _ = extract_text_and_type(db_doc.storage_path, db_doc.filename)
+        return {"content": content}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse document text: {e}")
