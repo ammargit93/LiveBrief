@@ -1,14 +1,15 @@
 import json
 import logging
+import asyncio
 from uuid import UUID
 from typing import Dict, Any, List, TypedDict, Tuple
 from openai import OpenAI
 from sqlalchemy import select, update, desc
 from sqlalchemy.ext.asyncio import AsyncSession
-from backend.app.config import settings
-from backend.app.database import async_session_maker
+from backend.app.core.config import settings
+from backend.app.core.database import async_session_maker
 from backend.app.models import Document, Entity, Embedding, Conflict, Review, ProjectSummary, GraphRun
-from backend.app.embeddings import get_embedding, cosine_similarity
+from backend.app.services.embedding_service import get_embedding, cosine_similarity
 
 # Logger configuration
 logging.basicConfig(level=logging.INFO)
@@ -126,8 +127,8 @@ async def extraction_node(state: AgentState) -> AgentState:
         await update_job_node(db, run_id, "extraction")
         
         chunks = state["chunks"]
-        # Process chunks in batches of 15 chunks (roughly 4500 tokens) to support large files
-        batch_size = 15
+        # Process chunks in smaller batches to avoid token per minute (TPM) limit on free tier
+        batch_size = 3
         entities_list = []
         
         try:
@@ -176,6 +177,9 @@ JSON format:
                 )
                 extracted_data = json.loads(response.choices[0].message.content)
                 
+                # Add a brief rate-limiting sleep between batches
+                await asyncio.sleep(2.0)
+                
                 # Map entity types and save to DB
                 for key, items in extracted_data.items():
                     type_map = {
@@ -196,11 +200,16 @@ JSON format:
                             continue
                         source_excerpt = item.pop("source_excerpt", "")
                         
+                        # Generate embedding for the entity JSON structure to enable pgvector searches
+                        val_str = json.dumps(item)
+                        entity_vector = get_embedding(val_str)
+                        
                         db_entity = Entity(
                             document_id=doc_id,
                             type=entity_type,
                             value=item,
-                            source_excerpt=source_excerpt
+                            source_excerpt=source_excerpt,
+                            embedding=entity_vector
                         )
                         db.add(db_entity)
                         await db.flush() # populate ID
@@ -233,7 +242,7 @@ JSON format:
             
     return state
 
-# Node 3: Knowledge Merge (Comparing new entities with existing ones using Python cosine similarity)
+# Node 3: Knowledge Merge (Comparing new entities with existing ones using pgvector cosine_distance)
 async def knowledge_merge_node(state: AgentState) -> AgentState:
     run_id = state["run_id"]
     doc_id = state["document_id"]
@@ -246,34 +255,36 @@ async def knowledge_merge_node(state: AgentState) -> AgentState:
         conflicts_to_check = []
         
         try:
-            # Query existing entities of similar categories NOT from the current document, isolated by workspace
-            stmt = select(Entity).join(Document).where(Entity.document_id != doc_id).where(Document.workspace_id == state["workspace_id"])
-            res = await db.execute(stmt)
-            existing_entities = res.scalars().all()
-            
             for new_ent in new_entities:
                 new_type = new_ent["type"]
                 new_val_str = json.dumps(new_ent["value"])
                 new_vec = get_embedding(new_val_str)
                 
-                for ext_ent in existing_entities:
-                    if ext_ent.type == new_type:
-                        ext_val_str = json.dumps(ext_ent.value)
-                        ext_vec = get_embedding(ext_val_str)
-                        
-                        similarity = cosine_similarity(new_vec, ext_vec)
-                        # Threshold for merging / conflict check candidate: 0.4
-                        if similarity >= 0.40:
-                            conflicts_to_check.append({
-                                "new_entity": new_ent,
-                                "existing_entity": {
-                                    "id": str(ext_ent.id),
-                                    "type": ext_ent.type,
-                                    "value": ext_ent.value,
-                                    "source_excerpt": ext_ent.source_excerpt,
-                                    "document_id": str(ext_ent.document_id)
-                                }
-                            })
+                # Query existing entities of the same type NOT from the current document, isolated by workspace
+                # Filter by cosine distance <= 0.60 (corresponds to cosine similarity >= 0.40)
+                stmt = (
+                    select(Entity)
+                    .join(Document)
+                    .where(Entity.document_id != doc_id)
+                    .where(Document.workspace_id == state["workspace_id"])
+                    .where(Entity.type == new_type)
+                    .where(Entity.embedding.cosine_distance(new_vec) <= 0.60)
+                    .order_by(Entity.embedding.cosine_distance(new_vec))
+                )
+                res = await db.execute(stmt)
+                matching_entities = res.scalars().all()
+                
+                for ext_ent in matching_entities:
+                    conflicts_to_check.append({
+                        "new_entity": new_ent,
+                        "existing_entity": {
+                            "id": str(ext_ent.id),
+                            "type": ext_ent.type,
+                            "value": ext_ent.value,
+                            "source_excerpt": ext_ent.source_excerpt,
+                            "document_id": str(ext_ent.document_id)
+                        }
+                    })
                             
             state["conflicts"] = conflicts_to_check
         except Exception as e:
@@ -292,6 +303,7 @@ async def conflict_detection_node(state: AgentState) -> AgentState:
         await update_job_node(db, run_id, "conflict_detection")
         
         candidates = state["conflicts"]
+        new_entities = state["entities"]
         detected_conflicts = []
         affected_sections = set()
         
@@ -300,71 +312,59 @@ async def conflict_detection_node(state: AgentState) -> AgentState:
             "feature": ["Major Features"],
             "decision": ["Current Decisions", "Pending Decisions"],
             "component": ["Architecture"],
-            "risk": ["Known Risks"],
-            "action_item": ["Timeline"],
+            "risk": ["Known Risks", "Open Questions"],
             "deadline": ["Timeline"],
-            "owner": ["Project Overview"]
+            "owner": ["Project Overview"],
+            "action_item": ["Project Overview", "Timeline"]
         }
         
         try:
-            for cand in candidates:
-                new_ent = cand["new_entity"]
-                existing_ent = cand["existing_entity"]
+            for item in candidates:
+                new_ent = item["new_entity"]
+                ext_ent = item["existing_entity"]
                 
-                # Fetch filenames of source docs for better context
-                new_doc = await db.get(Document, new_ent["document_id"])
-                existing_doc = await db.get(Document, existing_ent["document_id"])
-                
-                new_source_name = new_doc.filename if new_doc else "New Document"
-                existing_source_name = existing_doc.filename if existing_doc else "Existing Document"
+                # Check semantic conflict using LLM reasoning
+                prompt = f"""You are an expert software project intelligence auditor. Compare these two project records of type '{new_ent['type']}'.
+Determine if they have a flat logical contradiction (e.g. they specify conflicting timelines, contradicting system decisions, or directly opposing owners/features).
 
-                prompt = f"""You are a senior software product analyst. Compare the following two entities extracted from different project documents.
-Entity Type: {new_ent['type']}
+Record A:
+- Excerpt: \"{ext_ent['source_excerpt']}\"
+- Fact Details: {json.dumps(ext_ent['value'])}
 
-Existing Item (from {existing_source_name}):
-Value: {json.dumps(existing_ent['value'])}
-Excerpt: "{existing_ent['source_excerpt']}"
+Record B (New):
+- Excerpt: \"{new_ent['source_excerpt']}\"
+- Fact Details: {json.dumps(new_ent['value'])}
 
-New Item (from {new_source_name}):
-Value: {json.dumps(new_ent['value'])}
-Excerpt: "{new_ent['source_excerpt']}"
-
-Evaluate:
-1. Direct Contradiction: Do these statements conflict? (e.g. Auth is Auth0 vs Auth is custom JWT).
-2. Staleness / Superseding: Does the new item update, override, or replace the old one? (e.g. sprint deadline changed from Aug 10 to Aug 15).
-3. If they are identical or complement each other without conflict, they do NOT conflict.
-
-You must respond with a raw JSON object only.
-JSON format:
+Response format:
+You must respond with a raw JSON object only. Do not include markdown codeblocks or conversational text.
+JSON structure:
 {{
-  "conflict": true / false,
-  "category": "Name of the feature/decision/topic",
-  "severity": "high | medium | low",
-  "explanation": "Detailed explanation of the contradiction or why it is superseded"
+  "conflict": true | false,
+  "category": "Reason category (e.g. Timelines, Component Ownership, Auth mechanism, etc)",
+  "severity": "low | medium | high",
+  "explanation": "State clearly why Record B contradicts Record A"
 }}
 """
-
                 response = client.chat.completions.create(
                     model=settings.GROQ_MODEL,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
                     response_format={"type": "json_object"}
                 )
-                res_data = json.loads(response.choices[0].message.content)
+                audit = json.loads(response.choices[0].message.content)
                 
-                if res_data.get("conflict", False):
-                    # Save conflict to database
+                if audit.get("conflict"):
                     db_conflict = Conflict(
                         workspace_id=state["workspace_id"],
-                        category=res_data.get("category", new_ent["type"]),
-                        description=res_data.get("explanation", ""),
-                        severity=res_data.get("severity", "medium"),
-                        existing_entity_id=existing_ent["id"],
-                        new_entity_id=new_ent["id"],
+                        category=audit.get("category", "General"),
+                        description=audit.get("explanation", "Conflict detected"),
+                        severity=audit.get("severity", "medium"),
+                        existing_entity_id=UUID(ext_ent["id"]),
+                        new_entity_id=UUID(new_ent["id"]),
                         resolved=False
                     )
                     db.add(db_conflict)
-                    await db.flush()
+                    await db.flush() # Populate ID
                     
                     detected_conflicts.append({
                         "id": str(db_conflict.id),
@@ -373,20 +373,21 @@ JSON format:
                         "severity": db_conflict.severity
                     })
                     
-                    # Mark section as needing drafting
-                    sections = category_to_sections.get(new_ent["type"], ["Project Overview"])
+                    # Mark sections affected by this category
+                    sections = category_to_sections.get(new_ent["type"], [])
                     for s in sections:
                         affected_sections.add(s)
             
-            # If no conflicts, any new entity should still trigger section updates
+            # If no conflicts were found, we default to drafting all sections that match the new entity types
             if not affected_sections:
-                for ent in state["entities"]:
-                    sections = category_to_sections.get(ent["type"], ["Project Overview"])
+                for new_ent in new_entities:
+                    sections = category_to_sections.get(new_ent["type"], [])
                     for s in sections:
                         affected_sections.add(s)
                         
-            await db.commit()
             state["sections_to_draft"] = list(affected_sections)
+            await db.commit()
+            
         except Exception as e:
             logger.error(f"Error in conflict detection: {e}")
             state["error"] = str(e)
@@ -468,6 +469,9 @@ Please draft a clean, professional, and well-structured Markdown version of Sect
                 )
                 draft_content = response.choices[0].message.content.strip()
                 
+                # Add a brief rate-limiting sleep between section drafts
+                await asyncio.sleep(2.0)
+                
                 # Find if there is a linked conflict for this run
                 # We can query conflicts related to the new entities
                 conflict_id = None
@@ -527,7 +531,7 @@ async def run_agent_pipeline(run_id: str):
             
     # Read storage file
     try:
-        from backend.app.parsers import extract_text_and_type, chunk_text
+        from backend.app.services.parser_service import extract_text_and_type, chunk_text
         content, file_type = extract_text_and_type(doc.storage_path, doc.filename)
         chunks = chunk_text(content)
     except Exception as e:

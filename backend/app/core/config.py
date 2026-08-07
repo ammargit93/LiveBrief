@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     GROQ_API_BASE: str = os.environ.get("GROQ_API_BASE", "https://api.groq.com/openai/v1")
     GROQ_MODEL: str = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
     
-    # Embedding config (Dimension is matching the vocab length of our SimpleEmbedder, which is 50)
-    EMBEDDING_DIMENSION: int = 50
+    # Embedding config (Dimension is matching the output of all-MiniLM-L6-v2, which is 384)
+    EMBEDDING_DIMENSION: int = 384
 
     # Local Storage Settings
     STORAGE_PATH: str = os.environ.get("STORAGE_PATH", "./uploads")

@@ -3,7 +3,9 @@ from datetime import datetime
 from sqlalchemy import Column, String, Integer, Float, Boolean, DateTime, ForeignKey, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
 from sqlalchemy.orm import relationship
-from backend.app.database import Base
+from pgvector.sqlalchemy import Vector
+from backend.app.core.database import Base
+from backend.app.core.config import settings
 
 class Workspace(Base):
     __tablename__ = "workspaces"
@@ -36,7 +38,7 @@ class Embedding(Base):
     document_id = Column(UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
     chunk = Column(Text, nullable=False)
     chunk_index = Column(Integer, nullable=False)
-    embedding = Column(ARRAY(Float), nullable=False)
+    embedding = Column(Vector(settings.EMBEDDING_DIMENSION), nullable=False)
 
     document = relationship("Document", back_populates="embeddings")
 
@@ -48,6 +50,7 @@ class Entity(Base):
     type = Column(String(50), nullable=False)
     value = Column(JSONB, nullable=False)
     source_excerpt = Column(Text, nullable=True)
+    embedding = Column(Vector(settings.EMBEDDING_DIMENSION), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     document = relationship("Document", back_populates="entities")
