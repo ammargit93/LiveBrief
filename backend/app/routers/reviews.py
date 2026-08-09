@@ -6,7 +6,7 @@ from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.core.database import get_db
 from backend.app.models import Review, ProjectSummary, Conflict, Timeline
-from backend.app.schemas import ReviewResponse, RejectRequest
+from backend.app.schemas import ReviewResponse, RejectRequest, UpdateReviewRequest
 from backend.app.routers.deps import get_active_workspace_id
 
 router = APIRouter(prefix="/review", tags=["reviews"])
@@ -124,3 +124,32 @@ async def reject_review(
     
     await db.commit()
     return db_review
+
+@router.put("/{id}", response_model=ReviewResponse)
+async def update_review(
+    id: uuid.UUID,
+    data: UpdateReviewRequest,
+    workspace_id: uuid.UUID = Depends(get_active_workspace_id),
+    db: AsyncSession = Depends(get_db)
+):
+    db_review = await db.get(Review, id)
+    if not db_review or db_review.workspace_id != workspace_id:
+        raise HTTPException(status_code=404, detail="Review not found in this workspace")
+    if db_review.status != "pending":
+        raise HTTPException(status_code=400, detail="Only pending reviews can be updated")
+        
+    proposed = dict(db_review.proposed_change) if db_review.proposed_change else {}
+    if data.target_section is not None:
+        proposed["target_section"] = data.target_section
+    if data.new_value is not None:
+        proposed["new_value"] = data.new_value
+        
+    db_review.proposed_change = proposed
+    
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(db_review, "proposed_change")
+    
+    await db.commit()
+    await db.refresh(db_review)
+    return db_review
+

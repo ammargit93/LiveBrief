@@ -25,9 +25,15 @@ root_logger.setLevel(logging.INFO)
 logger = logging.getLogger("agent")
 logger.setLevel(logging.INFO)
 
-# Helper to call LLM using LangChain ChatGroq
-def call_llm(prompt: str, temperature: float = 0.0, json_mode: bool = False) -> str:
+# Helper to call LLM using LangChain ChatGroq with rate-limiting retries
+async def call_llm(prompt: str, temperature: float = 0.0, json_mode: bool = False) -> str:
     from langchain_groq import ChatGroq
+    import re
+    import asyncio
+    
+    max_retries = 6
+    backoff_delay = 2.0
+    
     if json_mode:
         llm = ChatGroq(
             model=settings.GROQ_MODEL,
@@ -40,8 +46,38 @@ def call_llm(prompt: str, temperature: float = 0.0, json_mode: bool = False) -> 
             groq_api_key=settings.GROQ_API_KEY,
             temperature=temperature
         )
-    response = llm.invoke(prompt)
-    return response.content
+        
+    for attempt in range(max_retries):
+        try:
+            response = await llm.ainvoke(prompt)
+            return response.content
+        except Exception as e:
+            err_msg = str(e)
+            is_rate_limit = "rate_limit" in err_msg.lower() or "429" in err_msg or "rate limit reached" in err_msg.lower()
+            
+            if is_rate_limit and attempt < max_retries - 1:
+                match_ms = re.search(r"try again in (\d+(?:\.\d+)?)ms", err_msg, re.IGNORECASE)
+                match_s = re.search(r"try again in (\d+(?:\.\d+)?)s", err_msg, re.IGNORECASE)
+                match_m = re.search(r"try again in (\d+(?:\.\d+)?)m(?!s)", err_msg, re.IGNORECASE)
+                
+                if match_ms:
+                    sleep_time = float(match_ms.group(1)) / 1000.0 + 0.5
+                elif match_s:
+                    sleep_time = float(match_s.group(1)) + 0.5
+                elif match_m:
+                    sleep_time = float(match_m.group(1)) * 60.0 + 0.5
+                else:
+                    match_any = re.search(r"try again in (\d+(?:\.\d+)?)", err_msg, re.IGNORECASE)
+                    if match_any:
+                        sleep_time = float(match_any.group(1)) + 0.5
+                    else:
+                        sleep_time = backoff_delay * (2 ** attempt)
+                    
+                logger.warning(f"Rate limit hit. Attempt {attempt + 1}/{max_retries}. Sleeping for {sleep_time:.2f}s before retrying...")
+                await asyncio.sleep(sleep_time)
+            else:
+                logger.error(f"LLM call failed after {attempt + 1} attempts: {e}")
+                raise e
 
 class AgentState(TypedDict):
     workspace_id: str
@@ -112,7 +148,7 @@ JSON format:
 """
 
         try:
-            content = call_llm(prompt, temperature=0.0, json_mode=True)
+            content = await call_llm(prompt, temperature=0.0, json_mode=True)
             data = json.loads(content)
             
             # Save type & confidence to DB
@@ -186,7 +222,7 @@ JSON structure:
 }}
 """
         try:
-            content = call_llm(prompt, temperature=0.0, json_mode=True)
+            content = await call_llm(prompt, temperature=0.0, json_mode=True)
             from backend.app.schemas.schemas import PlannerDecision
             decision = PlannerDecision.model_validate_json(content)
             
@@ -287,7 +323,7 @@ JSON format:
 }}
 """
 
-                content = call_llm(prompt, temperature=0.0, json_mode=True)
+                content = await call_llm(prompt, temperature=0.0, json_mode=True)
                 extracted_data = json.loads(content)
                 
                 # Add a brief rate-limiting sleep between batches
@@ -462,59 +498,118 @@ async def conflict_detection_node(state: AgentState) -> AgentState:
             return state
         
         try:
-            for item in candidates:
-                new_ent = item["new_entity"]
-                ext_ent = item["existing_entity"]
+            # Batch candidates in groups of 5 to avoid token limits per minute (TPM)
+            sub_batch_size = 5
+            for i in range(0, len(candidates), sub_batch_size):
+                batch_candidates = candidates[i : i + sub_batch_size]
                 
-                # Check semantic conflict using LLM reasoning
-                prompt = f"""You are an expert software project intelligence auditor. Compare these two project records of type '{new_ent['type']}'.
-Determine if they have a flat logical contradiction (e.g. they specify conflicting timelines, contradicting system decisions, or directly opposing owners/features).
+                prompt = f"""You are an expert software project intelligence auditor. Compare the following pairs of project records to determine if they contain a logical contradiction (i.e. a conflict).
 
-Record A:
-- Excerpt: \"{ext_ent['source_excerpt']}\"
+CORE RULE:
+Only flag a conflict (set "conflict": true) when two records refer to the EXACT SAME underlying milestone, task, entity, or system decision AND the EXACT SAME attribute, but contain values that cannot both be true.
+
+Do NOT flag the following as conflicts (set "conflict": false):
+* Different milestones with different dates (e.g. Internal Alpha Apr 10, Closed Beta May 1, Public Beta Jul 1). These are distinct chronological checkpoints, not a conflict.
+* A milestone or task being mentioned in one document but not the other (missing or null vs a populated value).
+* Different tasks having different owners.
+* Different features or decisions that happen to share keywords (e.g., "polling rejected for the feed" vs "real-time collaborative editing" are separate decisions).
+* Normal chronological relationships such as Design Freeze -> Alpha -> Beta.
+* A later document adding new information that an earlier document didn't contain.
+* A later document intentionally updating or replacing an earlier decision (this is "Updated/Superseded", not a conflict).
+
+DO flag the following as conflicts (set "conflict": true):
+* Same milestone with conflicting dates (e.g., Closed Beta is May 1 vs Closed Beta is June 15).
+* Same task with conflicting due dates.
+* Same task/entity with different owners.
+* Same system decision with incompatible decisions (e.g., "Use PostgreSQL" vs "Use MongoDB" for the same primary database).
+
+Distinguish between:
+1. "Conflict" -> genuinely incompatible claims about the same attribute of the same task/entity/decision (not including intentional updates or new info).
+2. "Updated/Superseded" -> a later document intentionally changes/updates an earlier decision or date.
+3. "New information" -> one document adds details that another didn't contain.
+
+If it is "Updated/Superseded" or "New information", you MUST set "conflict": false.
+
+Pairs to audit:
+"""
+                for idx, item in enumerate(batch_candidates):
+                    new_ent = item["new_entity"]
+                    ext_ent = item["existing_entity"]
+                    prompt += f"""
+--- Pair #{idx+1} ---
+Record A (Existing):
+- ID: {ext_ent['id']}
+- Excerpt: "{ext_ent['source_excerpt']}"
 - Fact Details: {json.dumps(ext_ent['value'])}
 
 Record B (New):
-- Excerpt: \"{new_ent['source_excerpt']}\"
+- ID: {new_ent['id']}
+- Excerpt: "{new_ent['source_excerpt']}"
 - Fact Details: {json.dumps(new_ent['value'])}
-
+"""
+                prompt += """
 Response format:
 You must respond with a raw JSON object only. Do not include markdown codeblocks or conversational text.
 JSON structure:
-{{
-  "conflict": true | false,
-  "category": "Reason category (e.g. Timelines, Component Ownership, Auth mechanism, etc)",
-  "severity": "low | medium | high",
-  "explanation": "State clearly why Record B contradicts Record A"
-}}
+{
+  "audits": [
+    {
+      "existing_id": "ID of Record A",
+      "new_id": "ID of Record B",
+      "conflict": true | false,
+      "category": "Reason category (e.g. Timelines, Component Ownership, Auth mechanism, etc)",
+      "severity": "low | medium | high",
+      "explanation": "State clearly why Record B contradicts Record A"
+    }
+  ]
+}
 """
-                content = call_llm(prompt, temperature=0.0, json_mode=True)
-                audit = json.loads(content)
+                try:
+                    content = await call_llm(prompt, temperature=0.0, json_mode=True)
+                    audit_data = json.loads(content)
+                    audits = audit_data.get("audits", [])
+                except Exception as audit_err:
+                    logger.error(f"Audit batch LLM call failed: {audit_err}")
+                    audits = []
+                    
+                audits_map = {(a.get("existing_id"), a.get("new_id")): a for a in audits}
                 
-                if audit.get("conflict"):
-                    db_conflict = Conflict(
-                        workspace_id=state["workspace_id"],
-                        category=audit.get("category", "General"),
-                        description=audit.get("explanation", "Conflict detected"),
-                        severity=audit.get("severity", "medium"),
-                        existing_entity_id=UUID(ext_ent["id"]),
-                        new_entity_id=UUID(new_ent["id"]),
-                        resolved=False
-                    )
-                    db.add(db_conflict)
-                    await db.flush() # Populate ID
+                for item in batch_candidates:
+                    new_ent = item["new_entity"]
+                    ext_ent = item["existing_entity"]
                     
-                    detected_conflicts.append({
-                        "id": str(db_conflict.id),
-                        "category": db_conflict.category,
-                        "description": db_conflict.description,
-                        "severity": db_conflict.severity
-                    })
-                    
-                    # Mark sections affected by this category
-                    sections = category_to_sections.get(new_ent["type"], [])
-                    for s in sections:
-                        affected_sections.add(s)
+                    audit = audits_map.get((str(ext_ent["id"]), str(new_ent["id"])))
+                    if not audit:
+                        audit = {"conflict": False}
+                        
+                    if audit.get("conflict"):
+                        db_conflict = Conflict(
+                            workspace_id=state["workspace_id"],
+                            category=audit.get("category", "General"),
+                            description=audit.get("explanation", "Conflict detected"),
+                            severity=audit.get("severity", "medium"),
+                            existing_entity_id=UUID(ext_ent["id"]),
+                            new_entity_id=UUID(new_ent["id"]),
+                            resolved=False
+                        )
+                        db.add(db_conflict)
+                        await db.flush() # Populate ID
+                        
+                        detected_conflicts.append({
+                            "id": str(db_conflict.id),
+                            "category": db_conflict.category,
+                            "description": db_conflict.description,
+                            "severity": db_conflict.severity
+                        })
+                        
+                        # Mark sections affected by this category
+                        sections = category_to_sections.get(new_ent["type"], [])
+                        for s in sections:
+                            affected_sections.add(s)
+                            
+                # Sleep briefly between sub-batches to be kind to Groq rate limits
+                if i + sub_batch_size < len(candidates):
+                    await asyncio.sleep(2.0)
             
             # If no conflicts were found, we default to drafting all sections that match the new entity types
             if not affected_sections:
@@ -626,7 +721,7 @@ GROUNDING RULES:
 5. Do not add any introductory or concluding comments. Start directly with the updated Markdown content.
 """
                 
-                draft_content = call_llm(prompt, temperature=0.2, json_mode=False).strip()
+                draft_content = (await call_llm(prompt, temperature=0.2, json_mode=False)).strip()
                 
                 # Add a brief rate-limiting sleep between section drafts
                 await asyncio.sleep(2.0)

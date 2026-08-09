@@ -6,4 +6,5 @@ from backend.app.schemas.schemas import (
     RejectRequest,
     TimelineResponse,
     JobResponse,
+    UpdateReviewRequest,
 )

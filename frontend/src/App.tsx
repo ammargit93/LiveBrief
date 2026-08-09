@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { 
   FileText, CheckSquare, AlertTriangle, Clock, Upload, 
-  Check, X, FileCode, FileDown, RefreshCw, MessageSquare, Plus, Activity
+  Check, FileCode, FileDown, RefreshCw, MessageSquare, Plus, Activity
 } from 'lucide-react';
 
 const API_BASE = 'http://localhost:8000';
@@ -51,6 +51,9 @@ export default function App() {
   const [briefSections, setBriefSections] = useState<any[]>([]);
   const [conflicts, setConflicts] = useState<any[]>([]);
   const [reviews, setReviews] = useState<any[]>([]);
+  const [editingReviewId, setEditingReviewId] = useState<string | null>(null);
+  const [editTargetSection, setEditTargetSection] = useState<string>('');
+  const [editNewValue, setEditNewValue] = useState<string>('');
   const [timeline, setTimeline] = useState<any[]>([]);
   const [jobs, setJobs] = useState<any[]>([]);
   
@@ -292,6 +295,33 @@ export default function App() {
       }
     } catch (e) {
       console.error(e);
+    }
+  };
+
+  const handleSaveReviewEdit = async (id: string, approveAfterSave = false) => {
+    try {
+      const res = await fetch(`${API_BASE}/review/${id}?workspace_id=${activeWorkspaceId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          target_section: editTargetSection,
+          new_value: editNewValue,
+        }),
+      });
+      if (res.ok) {
+        if (approveAfterSave) {
+          await handleApproveReview(id);
+        } else {
+          fetchWorkspaceData(activeWorkspaceId);
+        }
+        setEditingReviewId(null);
+      } else {
+        const err = await res.json();
+        alert(`Failed to save edit: ${err.detail || 'Error'}`);
+      }
+    } catch (e) {
+      console.error(e);
+      alert(`Error saving edit: ${e}`);
     }
   };
 
@@ -617,7 +647,16 @@ export default function App() {
                     <div className="flex justify-between items-start border-b border-slate-200 pb-2 mb-3">
                       <div>
                         <span className="text-[9px] font-bold text-indigo-600 uppercase tracking-wide">Section Recommendation</span>
-                        <h4 className="text-sm font-bold text-slate-900 mt-0.5">{rev.proposed_change.target_section}</h4>
+                        {editingReviewId === rev.id ? (
+                          <input
+                            type="text"
+                            value={editTargetSection}
+                            onChange={(e) => setEditTargetSection(e.target.value)}
+                            className="text-xs font-bold text-slate-900 border border-slate-300 px-2 py-1 focus:outline-none focus:ring-1 focus:ring-indigo-500 rounded-none w-80 block mt-1"
+                          />
+                        ) : (
+                          <h4 className="text-sm font-bold text-slate-900 mt-0.5">{rev.proposed_change.target_section}</h4>
+                        )}
                       </div>
                       <div className="text-right text-[10px]">
                         <span className="text-slate-400 block">Source Document</span>
@@ -644,29 +683,72 @@ export default function App() {
                       </div>
                       <div className="space-y-1">
                         <span className="text-[9px] font-bold text-green-700 uppercase tracking-wider block">Proposed Text</span>
-                        <div className="p-2.5 bg-green-50/50 border border-green-100 rounded-none text-xs text-slate-800 font-mono h-40 overflow-y-auto whitespace-pre-wrap">
-                          {rev.proposed_change.new_value}
-                        </div>
+                        {editingReviewId === rev.id ? (
+                          <textarea
+                            value={editNewValue}
+                            onChange={(e) => setEditNewValue(e.target.value)}
+                            className="w-full p-2.5 bg-white border border-slate-300 rounded-none text-xs text-slate-800 font-mono h-40 focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-none"
+                          />
+                        ) : (
+                          <div className="p-2.5 bg-green-50/50 border border-green-100 rounded-none text-xs text-slate-800 font-mono h-40 overflow-y-auto whitespace-pre-wrap">
+                            {rev.proposed_change.new_value}
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>
 
                   <div className="flex gap-2 justify-end border-t border-slate-100 pt-3">
-                    <button 
-                      onClick={() => {
-                        setRejectReason('');
-                        setShowRejectModal(rev.id);
-                      }}
-                      className="px-3.5 py-1.5 text-xs font-semibold border border-red-300 text-red-700 hover:bg-red-50 rounded-none cursor-pointer transition-all"
-                    >
-                      Reject Draft
-                    </button>
-                    <button 
-                      onClick={() => handleApproveReview(rev.id)}
-                      className="px-3.5 py-1.5 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white rounded-none cursor-pointer transition-all flex items-center gap-1"
-                    >
-                      <Check className="h-4 w-4" /> Approve & Apply
-                    </button>
+                    {editingReviewId === rev.id ? (
+                      <>
+                        <button
+                          onClick={() => setEditingReviewId(null)}
+                          className="px-3.5 py-1.5 text-xs font-semibold border border-slate-300 text-slate-700 hover:bg-slate-50 rounded-none cursor-pointer transition-all"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={() => handleSaveReviewEdit(rev.id, false)}
+                          className="px-3.5 py-1.5 text-xs font-semibold border border-indigo-300 text-indigo-700 hover:bg-indigo-50 rounded-none cursor-pointer transition-all"
+                        >
+                          Save Draft
+                        </button>
+                        <button
+                          onClick={() => handleSaveReviewEdit(rev.id, true)}
+                          className="px-3.5 py-1.5 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white rounded-none cursor-pointer transition-all flex items-center gap-1"
+                        >
+                          <Check className="h-4 w-4" /> Save & Approve
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          onClick={() => {
+                            setEditingReviewId(rev.id);
+                            setEditTargetSection(rev.proposed_change.target_section || '');
+                            setEditNewValue(rev.proposed_change.new_value || '');
+                          }}
+                          className="px-3.5 py-1.5 text-xs font-semibold border border-slate-300 text-slate-700 hover:bg-slate-50 rounded-none cursor-pointer transition-all"
+                        >
+                          Edit
+                        </button>
+                        <button 
+                          onClick={() => {
+                            setRejectReason('');
+                            setShowRejectModal(rev.id);
+                          }}
+                          className="px-3.5 py-1.5 text-xs font-semibold border border-red-300 text-red-700 hover:bg-red-50 rounded-none cursor-pointer transition-all"
+                        >
+                          Reject Draft
+                        </button>
+                        <button 
+                          onClick={() => handleApproveReview(rev.id)}
+                          className="px-3.5 py-1.5 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white rounded-none cursor-pointer transition-all flex items-center gap-1"
+                        >
+                          <Check className="h-4 w-4" /> Approve & Apply
+                        </button>
+                      </>
+                    )}
                   </div>
                 </div>
               ))

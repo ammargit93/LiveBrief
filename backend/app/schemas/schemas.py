@@ -87,3 +87,8 @@ class JobResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class UpdateReviewRequest(BaseModel):
+    target_section: Optional[str] = None
+    new_value: Optional[str] = None
+
