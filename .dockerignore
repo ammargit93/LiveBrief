@@ -1,0 +1,44 @@
+# Version control
+.git
+.gitignore
+
+# Python caches and environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+
+# Node caches and modules
+node_modules/
+frontend/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+
+# Build directories
+dist/
+build/
+frontend/dist/
+
+# Local configuration and variables
+.env
+.env.*
+.gemini/
+.agents/
+.vscode/
+.idea/
+
+# Local application storage
+uploads/
+assets/
+backend/app/uploads/
+*.db
+*.log

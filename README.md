@@ -307,6 +307,30 @@ async def run_agent():
 asyncio.run(run_agent())
 ```
 
+## 🐳 Docker Quickstart (Single-Command Setup)
+
+You can spin up the entire LiveBrief stack (PostgreSQL with pgvector, FastAPI backend, and React frontend) with a single command.
+
+### Prerequisites
+Make sure you have [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/) installed.
+
+### Steps
+1. Create a `.env` file in the root directory and add your Groq API credentials:
+   ```env
+   GROQ_API_KEY=your-groq-api-key-here
+   GROQ_MODEL=llama-3.1-8b-instant
+   ```
+2. Build and start all services:
+   ```bash
+   docker compose up --build
+   ```
+
+This command will:
+- Start the PostgreSQL database and automatically initialize the schema and required extensions (`pgvector`).
+- Build and run the FastAPI backend at `http://localhost:8000`.
+- Build and run the React frontend dev server at `http://localhost:5173`.
+- Auto-mount the MCP SSE server endpoint at `http://localhost:8000/mcp/sse`.
+
 ---
 
 ## 🛠️ Local Installation & Development
