@@ -54,3 +54,7 @@ app.add_middleware(
 
 # Mount all routes
 app.include_router(api_router)
+
+# Mount the MCP server's SSE application at /mcp
+from backend.app.mcp_server import mcp
+app.mount("/mcp", mcp.sse_app())

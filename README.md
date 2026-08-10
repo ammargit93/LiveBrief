@@ -283,6 +283,107 @@ erDiagram
 
 ---
 
+## 🤖 Model Context Protocol (MCP) Server
+
+LiveBrief exposes its core agentic and document intelligence capabilities through an integrated Model Context Protocol (MCP) server. This allows external LLMs, AI agents, or developer clients (such as Cursor or Claude Desktop) to programmatically interact with LiveBrief workspaces, ingest documents, check pipeline runs, track conflicts, and resolve project brief updates.
+
+### 🌐 MCP Transport
+The LiveBrief MCP server supports two transport mechanisms:
+1. **Server-Sent Events (SSE)** (Default for network access): Mounted directly on the FastAPI web server at `http://localhost:8000/mcp/sse`. This transport allows multiple external clients to connect concurrently over the network.
+2. **Standard Input/Output (stdio)** (Default for local execution): Available by running the Python script directly.
+
+### 🛠️ Exposed MCP Tools
+
+The following tools are available to any connected MCP client:
+
+| Tool Name | Arguments | Description | Output Schema |
+|---|---|---|---|
+| `create_workspace` | `name` (string) | Create a new workspace with default template sections. | `{"workspace_id": "...", "name": "..."}` |
+| `list_workspaces` | None | List all available workspaces in the database. | Array of `{"workspace_id": "...", "name": "..."}` |
+| `ingest_document` | `workspace_id` (string), `filename` (string), `content` (string) | Ingest a document and queue it for parsing and agent processing. | `{"document_id": "...", "run_id": "..."}` |
+| `get_run_status` | `run_id` (string) | Retrieve execution details (status, node, planner decision, errors) of a job run. | `{"run_id": "...", "status": "...", "current_node": "...", "planner": {...}, "error": "..."}` |
+| `get_project_brief` | `workspace_id` (string) | Retrieve current compiled brief sections, content, and version tracking. | Array of `{"section": "...", "version": 1, "content": "..."}` |
+| `get_conflicts` | `workspace_id` (string) | Retrieve unresolved document conflicts and recommendations. | Array of `{"conflict_id": "...", "category": "...", "description": "...", "source_entities": {...}}` |
+| `get_pending_reviews` | `workspace_id` (string) | Retrieve pending proposed changes waiting in the review queue. | Array of `{"review_id": "...", "proposed_change": {...}, "status": "pending"}` |
+| `approve_review` | `review_id` (string) | Approve a pending review, committing recommendations to the brief. | `{"review_id": "...", "status": "approved", "brief_section": "...", "new_version": 2}` |
+| `reject_review` | `review_id` (string), `rejection_reason` (string) | Reject and discard a proposed brief update. | `{"review_id": "...", "status": "rejected", "reason": "..."}` |
+| `get_audit_trail` | `workspace_id` (string) | Retrieve chronological history/timeline of all workspace modifications. | Array of `{"timestamp": "...", "event": "...", "reason": "...", "actor": "..."}` |
+| `resume_run` | `run_id` (string) | Resume and restart a failed GraphRun pipeline processing job. | `{"run_id": "...", "status": "running", "current_node": "upload"}` |
+
+### 🚀 Starting the MCP Server
+
+Since the MCP server is mounted directly into the FastAPI application, starting the backend web application automatically serves the MCP server over HTTP SSE:
+
+```bash
+# Start backend API (including MCP SSE server at /mcp/sse)
+uv run uvicorn backend.app.main:app --reload --port 8000
+```
+
+To run the MCP server standalone in stdio mode:
+```bash
+uv run python -m backend.app.mcp_server
+```
+
+### 🔌 Connecting an MCP Client
+
+#### 1. Connecting via SSE (Network/HTTP)
+Configure your MCP client to connect to the SSE endpoint:
+- **SSE URL**: `http://localhost:8000/mcp/sse`
+- **Client Post URL**: `http://localhost:8000/mcp/messages`
+
+#### 2. Connecting via Stdio (Local Process)
+To configure local developer environments like **Cursor** or **Claude Desktop**, specify the local process command:
+
+##### Cursor Configuration:
+Go to **Settings** -> **Features** -> **MCP**, click **+ Add New MCP Server**, and set:
+- **Name**: `LiveBrief`
+- **Type**: `stdio`
+- **Command**: `uv run python -m backend.app.mcp_server`
+- **Execution Directory (Cwd)**: `C:/Projects/Python-projects/LiveBrief`
+
+##### Claude Desktop Configuration (`claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "livebrief": {
+      "command": "uv",
+      "args": ["run", "python", "-m", "backend.app.mcp_server"],
+      "cwd": "C:/Projects/Python-projects/LiveBrief"
+    }
+  }
+}
+```
+
+### 🤖 Example: External Agent Calling LiveBrief
+Below is an example of an external Python script using the `mcp` client SDK to list workspaces and ingest a document:
+
+```python
+import asyncio
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+
+async def run_agent():
+    async with sse_client("http://localhost:8000/mcp/sse") as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            
+            # 1. List available workspaces
+            workspaces = await session.call_tool("list_workspaces")
+            print("Workspaces:", workspaces.content[0].text)
+            
+            # 2. Ingest a document
+            ingest_result = await session.call_tool("ingest_document", {
+                "workspace_id": "your-workspace-uuid-here",
+                "filename": "meeting_notes.md",
+                "content": "# Product Meeting Notes\n* Authentication should use JWT tokens."
+            })
+            print("Ingest Result:", ingest_result.content[0].text)
+
+asyncio.run(run_agent())
+```
+
+---
+
 ## 🛠️ Local Installation & Development
 
 ### 1. Database Setup
