@@ -80,6 +80,7 @@ const diffLines = (oldStr: string, newStr: string) => {
 export default function App() {
   const [activeTab, setActiveTab] = useState('brief');
   const [diffViewMode, setDiffViewMode] = useState<'split' | 'unified'>('unified');
+  const [selectedDocForReview, setSelectedDocForReview] = useState<string>('');
   const [workspaces, setWorkspaces] = useState<any[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string>(() => {
     return localStorage.getItem('activeWorkspaceId') || '';
@@ -718,6 +719,9 @@ export default function App() {
 
           // Group reviews by source document
           const uniqueDocs = Array.from(new Set(pendingReviews.map(r => r.proposed_change.source_document || 'General Ingestion')));
+          
+          // Get the currently selected document (default to first one)
+          const activeDoc = uniqueDocs.includes(selectedDocForReview) ? selectedDocForReview : uniqueDocs[0];
 
           const ALL_SECTIONS = [
             "Project Overview",
@@ -730,206 +734,223 @@ export default function App() {
             "Timeline"
           ];
 
+          const docReviews = pendingReviews.filter(r => (r.proposed_change.source_document || 'General Ingestion') === activeDoc);
+          const changedSections = docReviews.map(r => r.proposed_change.section || r.proposed_change.target_section);
+          const unchangedSections = ALL_SECTIONS.filter(s => !changedSections.includes(s));
+
           return (
-            <div className="max-w-4xl mx-auto space-y-8">
-              {uniqueDocs.map(docName => {
-                const docReviews = pendingReviews.filter(r => (r.proposed_change.source_document || 'General Ingestion') === docName);
-                const changedSections = docReviews.map(r => r.proposed_change.section || r.proposed_change.target_section);
-                const unchangedSections = ALL_SECTIONS.filter(s => !changedSections.includes(s));
+            <div className="max-w-4xl mx-auto space-y-6">
+              {/* Document Selector Dropdown Header */}
+              <div className="bg-white border border-slate-200 p-4 rounded-none flex flex-col md:flex-row md:items-center justify-between gap-4 shadow-sm text-left">
+                <div>
+                  <h4 className="text-xs font-bold text-slate-900 uppercase tracking-wider">Document Ingestion Review Queue</h4>
+                  <p className="text-[11px] text-slate-500 mt-0.5">Select an ingested document below to review its proposed updates and unchanged brief sections.</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <label className="text-[11px] font-bold text-slate-700 uppercase tracking-wider whitespace-nowrap">Document:</label>
+                  <select
+                    value={activeDoc}
+                    onChange={(e) => setSelectedDocForReview(e.target.value)}
+                    className="bg-slate-50 border border-slate-300 text-slate-900 text-xs px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 rounded-none font-medium min-w-[240px] cursor-pointer"
+                  >
+                    {uniqueDocs.map(doc => (
+                      <option key={doc} value={doc}>{doc}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
 
-                return (
-                  <div key={docName} className="space-y-4 bg-white border border-slate-200 p-6 rounded-none shadow-sm text-left">
-                    {/* Source Document Header */}
-                    <div className="border-b border-indigo-100 pb-3 mb-4 flex justify-between items-center bg-indigo-50/30 px-3 py-2 -mx-6 -mt-6">
-                      <span className="text-xs font-bold text-indigo-700 uppercase tracking-wider">Document Ingestion Run: {docName}</span>
-                      <span className="text-[10px] text-indigo-600 bg-indigo-50 border border-indigo-100 px-2 py-0.5 font-semibold">
-                        {docReviews.length} section change(s)
-                      </span>
-                    </div>
+              {/* Selected Document Details Card */}
+              <div className="space-y-4 bg-white border border-slate-200 p-6 rounded-none shadow-sm text-left">
+                {/* Source Document Header */}
+                <div className="border-b border-indigo-100 pb-3 mb-4 flex justify-between items-center bg-indigo-50/30 px-3 py-2 -mx-6 -mt-6">
+                  <span className="text-xs font-bold text-indigo-700 uppercase tracking-wider">Active Review Target: {activeDoc}</span>
+                  <span className="text-[10px] text-indigo-600 bg-indigo-50 border border-indigo-100 px-2 py-0.5 font-semibold">
+                    {docReviews.length} section change(s)
+                  </span>
+                </div>
 
-                    {/* Section Updates */}
-                    <div className="space-y-6">
-                      {docReviews.map(rev => {
-                        const operation = rev.proposed_change.operation || 'MODIFY';
-                        const reason = rev.proposed_change.reason || 'Entity update detected by planner.';
-                        const sourceProv = rev.proposed_change.source_provenance || rev.proposed_change.source_document || docName;
+                {/* Section Updates */}
+                <div className="space-y-6">
+                  {docReviews.map(rev => {
+                    const operation = rev.proposed_change.operation || 'MODIFY';
+                    const reason = rev.proposed_change.reason || 'Entity update detected by planner.';
+                    const sourceProv = rev.proposed_change.source_provenance || rev.proposed_change.source_document || activeDoc;
 
-                        return (
-                          <div key={rev.id} className="border border-slate-200 p-4 rounded-none bg-slate-50/50 space-y-4">
-                            <div className="flex justify-between items-start border-b border-slate-200 pb-2">
-                              <div>
-                                <span className={`text-[9px] font-bold px-1.5 py-0.5 border mr-2 uppercase tracking-wide rounded-none ${
-                                  operation === 'add' ? 'bg-green-50 border-green-200 text-green-700' : 'bg-amber-50 border-amber-200 text-amber-700'
-                                }`}>
-                                  {rev.proposed_change.section || rev.proposed_change.target_section} — {operation.toUpperCase()}
-                                </span>
-                              </div>
-                              <div className="text-right text-[10px]">
-                                <span className="text-slate-500 font-semibold">Source: {sourceProv}</span>
-                              </div>
+                    return (
+                      <div key={rev.id} className="border border-slate-200 p-4 rounded-none bg-slate-50/50 space-y-4">
+                        <div className="flex justify-between items-start border-b border-slate-200 pb-2">
+                          <div>
+                            <span className={`text-[9px] font-bold px-1.5 py-0.5 border mr-2 uppercase tracking-wide rounded-none ${
+                              operation === 'add' ? 'bg-green-50 border-green-200 text-green-700' : 'bg-amber-50 border-amber-200 text-amber-700'
+                            }`}>
+                              {rev.proposed_change.section || rev.proposed_change.target_section} — {operation.toUpperCase()}
+                            </span>
+                          </div>
+                          <div className="text-right text-[10px]">
+                            <span className="text-slate-500 font-semibold">Source: {sourceProv}</span>
+                          </div>
+                        </div>
+
+                        {rev.conflict_id && (
+                          <div className="p-2 bg-amber-50 border border-amber-200 rounded-none flex items-start gap-2 text-[10px] text-amber-800">
+                            <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-600" />
+                            <div>
+                              <span className="font-bold">Conflict Resolution Included</span>
+                              <p className="text-[9px] text-amber-700 mt-0.5">Approving this recommendation will mark the linked conflict as resolved.</p>
                             </div>
+                          </div>
+                        )}
 
-                            {rev.conflict_id && (
-                              <div className="p-2 bg-amber-50 border border-amber-200 rounded-none flex items-start gap-2 text-[10px] text-amber-800">
-                                <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-600" />
-                                <div>
-                                  <span className="font-bold">Conflict Resolution Included</span>
-                                  <p className="text-[9px] text-amber-700 mt-0.5">Approving this recommendation will mark the linked conflict as resolved.</p>
-                                </div>
-                              </div>
-                            )}
+                        {/* Diff View Mode Toggle (rendered only when not editing) */}
+                        {!editingReviewId && (
+                          <div className="flex justify-between items-center bg-slate-50 p-2 border border-slate-200">
+                            <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Visual Diff View</span>
+                            <div className="flex border border-slate-300 shadow-sm bg-white">
+                              <button
+                                onClick={() => setDiffViewMode('unified')}
+                                className={`px-3 py-1 text-[9px] font-bold uppercase transition-all cursor-pointer ${
+                                  diffViewMode === 'unified' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'
+                                }`}
+                              >
+                                Unified Diff (Git)
+                              </button>
+                              <button
+                                onClick={() => setDiffViewMode('split')}
+                                className={`px-3 py-1 text-[9px] font-bold uppercase transition-all cursor-pointer ${
+                                  diffViewMode === 'split' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'
+                                }`}
+                              >
+                                Side-by-Side
+                              </button>
+                            </div>
+                          </div>
+                        )}
 
-                            {/* Diff View Mode Toggle (rendered only when not editing) */}
-                            {!editingReviewId && (
-                              <div className="flex justify-between items-center bg-slate-50 p-2 border border-slate-200">
-                                <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Visual Diff View</span>
-                                <div className="flex border border-slate-300 shadow-sm bg-white">
-                                  <button
-                                    onClick={() => setDiffViewMode('unified')}
-                                    className={`px-3 py-1 text-[9px] font-bold uppercase transition-all cursor-pointer ${
-                                      diffViewMode === 'unified' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'
-                                    }`}
-                                  >
-                                    Unified Diff (Git)
-                                  </button>
-                                  <button
-                                    onClick={() => setDiffViewMode('split')}
-                                    className={`px-3 py-1 text-[9px] font-bold uppercase transition-all cursor-pointer ${
-                                      diffViewMode === 'split' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'
-                                    }`}
-                                  >
-                                    Side-by-Side
-                                  </button>
-                                </div>
-                              </div>
-                            )}
-
-                            {diffViewMode === 'unified' && !editingReviewId ? (
-                              <div className="p-3 bg-slate-950 text-slate-200 rounded-none text-xs font-mono h-64 overflow-y-auto whitespace-pre border border-slate-800 text-left leading-relaxed">
-                                {diffLines(rev.proposed_change.old_value || '', rev.proposed_change.new_value || '').map((line, idx) => {
-                                  if (line.type === 'added') {
-                                    return (
-                                      <div key={idx} className="bg-green-950/60 text-green-300 px-2 py-0.5 border-l-4 border-green-500">
-                                        + {line.value}
-                                      </div>
-                                    );
-                                  } else if (line.type === 'removed') {
-                                    return (
-                                      <div key={idx} className="bg-red-950/60 text-red-300 px-2 py-0.5 border-l-4 border-red-500">
-                                        - {line.value}
-                                      </div>
-                                    );
-                                  } else {
-                                    return (
-                                      <div key={idx} className="text-slate-400 px-2 py-0.5 pl-6">
-                                        {line.value}
-                                      </div>
-                                    );
-                                  }
-                                })}
-                              </div>
-                            ) : (
-                              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                <div className="space-y-1">
-                                  <span className="text-[9px] font-bold text-red-700 uppercase tracking-wider block text-left">Current/Old Value</span>
-                                  <div className="p-2.5 bg-red-50/30 border border-red-100 rounded-none text-xs text-slate-600 font-mono h-64 overflow-y-auto whitespace-pre-wrap text-left">
-                                    {rev.proposed_change.old_value || "(Empty Section)"}
-                                  </div>
-                                </div>
-                                <div className="space-y-1">
-                                  <span className="text-[9px] font-bold text-green-700 uppercase tracking-wider block text-left">Proposed/New Value</span>
-                                  {editingReviewId === rev.id ? (
-                                    <textarea
-                                      value={editNewValue}
-                                      onChange={(e) => setEditNewValue(e.target.value)}
-                                      className="w-full p-2.5 bg-white border border-slate-300 rounded-none text-xs text-slate-800 font-mono h-64 focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-none text-left"
-                                    />
-                                  ) : (
-                                    <div className="p-2.5 bg-green-50/30 border border-green-100 rounded-none text-xs text-slate-800 font-mono h-64 overflow-y-auto whitespace-pre-wrap text-left">
-                                      {rev.proposed_change.new_value}
+                        {diffViewMode === 'unified' && !editingReviewId ? (
+                          <div className="p-3 bg-slate-950 text-slate-200 rounded-none text-xs font-mono h-64 overflow-y-auto whitespace-pre border border-slate-800 text-left leading-relaxed">
+                            {diffLines(rev.proposed_change.old_value || '', rev.proposed_change.new_value || '').map((line, idx) => {
+                              if (line.type === 'added') {
+                                  return (
+                                    <div key={idx} className="bg-green-950/60 text-green-300 px-2 py-0.5 border-l-4 border-green-500">
+                                      + {line.value}
                                     </div>
-                                  )}
-                                </div>
+                                  );
+                              } else if (line.type === 'removed') {
+                                  return (
+                                    <div key={idx} className="bg-red-950/60 text-red-300 px-2 py-0.5 border-l-4 border-red-500">
+                                      - {line.value}
+                                    </div>
+                                  );
+                              } else {
+                                  return (
+                                    <div key={idx} className="text-slate-400 px-2 py-0.5 pl-6">
+                                      {line.value}
+                                    </div>
+                                  );
+                              }
+                            })}
+                          </div>
+                        ) : (
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div className="space-y-1">
+                              <span className="text-[9px] font-bold text-red-700 uppercase tracking-wider block text-left">Current/Old Value</span>
+                              <div className="p-2.5 bg-red-50/30 border border-red-100 rounded-none text-xs text-slate-600 font-mono h-64 overflow-y-auto whitespace-pre-wrap text-left">
+                                {rev.proposed_change.old_value || "(Empty Section)"}
                               </div>
-                            )}
-
-                            <div className="text-xs border-t border-slate-200 pt-2.5 flex flex-col gap-1 text-slate-700 text-left">
-                              <div><span className="font-bold text-slate-800">Reason:</span> {reason}</div>
                             </div>
-
-                            <div className="flex gap-2 justify-end border-t border-slate-100 pt-3">
+                            <div className="space-y-1">
+                              <span className="text-[9px] font-bold text-green-700 uppercase tracking-wider block text-left">Proposed/New Value</span>
                               {editingReviewId === rev.id ? (
-                                <>
-                                  <button
-                                    onClick={() => setEditingReviewId(null)}
-                                    className="px-3.5 py-1.5 text-xs font-semibold border border-slate-300 text-slate-700 hover:bg-slate-50 rounded-none cursor-pointer transition-all"
-                                  >
-                                    Cancel
-                                  </button>
-                                  <button
-                                    onClick={() => handleSaveReviewEdit(rev.id, false)}
-                                    className="px-3.5 py-1.5 text-xs font-semibold border border-indigo-300 text-indigo-700 hover:bg-indigo-50 rounded-none cursor-pointer transition-all"
-                                  >
-                                    Save Draft
-                                  </button>
-                                  <button
-                                    onClick={() => handleSaveReviewEdit(rev.id, true)}
-                                    className="px-3.5 py-1.5 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white rounded-none cursor-pointer transition-all flex items-center gap-1"
-                                  >
-                                    <Check className="h-4 w-4" /> Save & Approve
-                                  </button>
-                                </>
+                                <textarea
+                                  value={editNewValue}
+                                  onChange={(e) => setEditNewValue(e.target.value)}
+                                  className="w-full p-2.5 bg-white border border-slate-300 rounded-none text-xs text-slate-800 font-mono h-64 focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-none text-left"
+                                />
                               ) : (
-                                <>
-                                  <button
-                                    onClick={() => {
-                                      setEditingReviewId(rev.id);
-                                      setEditTargetSection(rev.proposed_change.section || rev.proposed_change.target_section || '');
-                                      setEditNewValue(rev.proposed_change.new_value || '');
-                                    }}
-                                    className="px-3.5 py-1.5 text-xs font-semibold border border-slate-300 text-slate-700 hover:bg-slate-50 rounded-none cursor-pointer transition-all"
-                                  >
-                                    Edit
-                                  </button>
-                                  <button 
-                                    onClick={() => {
-                                      setRejectReason('');
-                                      setShowRejectModal(rev.id);
-                                    }}
-                                    className="px-3.5 py-1.5 text-xs font-semibold border border-red-300 text-red-700 hover:bg-red-50 rounded-none cursor-pointer transition-all"
-                                  >
-                                    Reject Draft
-                                  </button>
-                                  <button 
-                                    onClick={() => handleApproveReview(rev.id)}
-                                    className="px-3.5 py-1.5 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white rounded-none cursor-pointer transition-all flex items-center gap-1"
-                                  >
-                                    <Check className="h-4 w-4" /> Approve & Apply
-                                  </button>
-                                </>
+                                <div className="p-2.5 bg-green-50/30 border border-green-100 rounded-none text-xs text-slate-800 font-mono h-64 overflow-y-auto whitespace-pre-wrap text-left">
+                                  {rev.proposed_change.new_value}
+                                </div>
                               )}
                             </div>
                           </div>
-                        );
-                      })}
-                    </div>
+                        )}
 
-                    {/* Unchanged Sections list */}
-                    {unchangedSections.length > 0 && (
-                      <div className="border-t border-slate-100 pt-3 mt-4 text-left">
-                        <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest block mb-2">Unchanged Sections</span>
-                        <div className="flex flex-wrap gap-2 justify-start">
-                          {unchangedSections.map(secName => (
-                            <span key={secName} className="text-[10px] bg-slate-100 border border-slate-200 text-slate-400 px-2 py-0.5 rounded-none font-mono">
-                              {secName} — UNCHANGED
-                            </span>
-                          ))}
+                        <div className="text-xs border-t border-slate-200 pt-2.5 flex flex-col gap-1 text-slate-700 text-left">
+                          <div><span className="font-bold text-slate-800">Reason:</span> {reason}</div>
+                        </div>
+
+                        <div className="flex gap-2 justify-end border-t border-slate-100 pt-3">
+                          {editingReviewId === rev.id ? (
+                            <>
+                              <button
+                                onClick={() => setEditingReviewId(null)}
+                                className="px-3.5 py-1.5 text-xs font-semibold border border-slate-300 text-slate-700 hover:bg-slate-50 rounded-none cursor-pointer transition-all"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                onClick={() => handleSaveReviewEdit(rev.id, false)}
+                                className="px-3.5 py-1.5 text-xs font-semibold border border-indigo-300 text-indigo-700 hover:bg-indigo-50 rounded-none cursor-pointer transition-all"
+                              >
+                                Save Draft
+                              </button>
+                              <button
+                                onClick={() => handleSaveReviewEdit(rev.id, true)}
+                                className="px-3.5 py-1.5 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white rounded-none cursor-pointer transition-all flex items-center gap-1"
+                              >
+                                <Check className="h-4 w-4" /> Save & Approve
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              <button
+                                onClick={() => {
+                                  setEditingReviewId(rev.id);
+                                  setEditTargetSection(rev.proposed_change.section || rev.proposed_change.target_section || '');
+                                  setEditNewValue(rev.proposed_change.new_value || '');
+                                }}
+                                className="px-3.5 py-1.5 text-xs font-semibold border border-slate-300 text-slate-700 hover:bg-slate-50 rounded-none cursor-pointer transition-all"
+                              >
+                                Edit
+                              </button>
+                              <button 
+                                onClick={() => {
+                                  setRejectReason('');
+                                  setShowRejectModal(rev.id);
+                                }}
+                                className="px-3.5 py-1.5 text-xs font-semibold border border-red-300 text-red-700 hover:bg-red-50 rounded-none cursor-pointer transition-all"
+                              >
+                                Reject Draft
+                              </button>
+                              <button 
+                                onClick={() => handleApproveReview(rev.id)}
+                                className="px-3.5 py-1.5 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white rounded-none cursor-pointer transition-all flex items-center gap-1"
+                              >
+                                <Check className="h-4 w-4" /> Approve & Apply
+                              </button>
+                            </>
+                          )}
                         </div>
                       </div>
-                    )}
+                    );
+                  })}
+                </div>
+
+                {/* Unchanged Sections list */}
+                {unchangedSections.length > 0 && (
+                  <div className="border-t border-slate-100 pt-3 mt-4 text-left">
+                    <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest block mb-2">Unchanged Sections</span>
+                    <div className="flex flex-wrap gap-2 justify-start">
+                      {unchangedSections.map(secName => (
+                        <span key={secName} className="text-[10px] bg-slate-100 border border-slate-200 text-slate-400 px-2 py-0.5 rounded-none font-mono">
+                          {secName} — UNCHANGED
+                        </span>
+                      ))}
+                    </div>
                   </div>
-                );
-              })}
+                )}
+              </div>
             </div>
           );
         })()}

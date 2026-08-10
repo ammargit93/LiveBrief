@@ -736,6 +736,67 @@ JSON structure:
             
     return state
 
+def format_citations_deterministically(text: str) -> str:
+    import re
+    # Strip any existing Citations section at the bottom of the LLM draft
+    text = re.sub(r'\n+\s*(?:#+\s*)?Citations.*$', '', text, flags=re.IGNORECASE | re.DOTALL)
+    
+    # Match square brackets or parentheses containing a filename with extension
+    pattern = r'(?:Source:\s*)?\[([^\]]*\.(?:md|pdf|docx)[^\]]*)\]|(?:Source:\s*)?\(([^)]*\.(?:md|pdf|docx)[^)]*)\)'
+    
+    # 1. Find all raw matches to construct the unique list
+    matches = re.findall(pattern, text, re.IGNORECASE)
+    raw_citations = []
+    for m in matches:
+        c = next((item for item in m if item), "").strip()
+        if c:
+            if c.lower().startswith("source:"):
+                c = c[7:].strip()
+            c = c.replace('[', '').replace(']', '').replace('(', '').replace(')', '').strip()
+            raw_citations.append(c)
+            
+    # 2. Build unique citations list preserving order
+    unique_citations = []
+    for c in raw_citations:
+        c_clean = c.replace(' · ', ' ').replace(' - ', ' ').strip()
+        c_clean = c_clean.strip(',. ')
+        if c_clean and c_clean not in unique_citations:
+            unique_citations.append(c_clean)
+            
+    # 3. Replace each citation in the text with its index
+    def replace_callback(match):
+        m = match.groups()
+        c = next((item for item in m if item), "").strip()
+        if not c:
+            return ""
+        if c.lower().startswith("source:"):
+            c = c[7:].strip()
+        c = c.replace('[', '').replace(']', '').replace('(', '').replace(')', '').strip()
+        c_clean = c.replace(' · ', ' ').replace(' - ', ' ').strip().strip(',. ')
+        if c_clean in unique_citations:
+            idx = unique_citations.index(c_clean) + 1
+            return f"({idx})"
+        return ""
+        
+    new_text = re.sub(pattern, replace_callback, text, flags=re.IGNORECASE)
+    
+    # 4. Clean up any empty parentheses or trailing punctuation around citations
+    new_text = new_text.replace('((', '(').replace('))', ')')
+    new_text = re.sub(r'\s+\((\d+)\)', r' (\1)', new_text)
+    
+    # 5. Merge adjacent citation numbers like (1)(2) into (1,2)
+    for _ in range(3):
+        new_text = re.sub(r'\((\d+(?:,\d+)*)\)\s*\((\d+)\)', r'(\1,\2)', new_text)
+        
+    # 6. Append the Citations list at the bottom of the section
+    if unique_citations:
+        citations_block = "\n\n### Citations\n"
+        for idx, cit in enumerate(unique_citations, 1):
+            citations_block += f"{idx}) {cit}\n"
+        new_text = new_text.rstrip() + citations_block
+        
+    return new_text
+
 # Node 5: Generate Project Brief Updates (Incremental Diff System)
 async def generate_brief_updates_node(state: AgentState) -> AgentState:
     run_id = state["run_id"]
@@ -818,18 +879,19 @@ Here are the extracted structured facts and decisions we must incorporate (both 
 
 Please draft an updated Markdown version of Section '{section_name}', provide a brief reason for the change, and list the source provenance (document names and page numbers).
 
-GROUNDING RULES:
+ GROUNDING RULES:
 1. Every claim, feature, tech decision, deadline, component, or item you add/update MUST be cited from the source facts.
-2. For every claim, append a citation exactly in one of the following formats depending on the file:
+2. For every claim, append an inline citation exactly in one of the following formats:
    - For PDF documents or documents with a page number, use: Source: [Document Name · Page X] where X is the page number from the corresponding 'Page' fact.
    - For other documents, use: Source: [Document Name]
    Crucial: Output exactly: Source: [Document Name · Page X] or Source: [Document Name]. Do not include any URL links or parentheses containing a URL.
 3. STRICT HACK PREVENTION: Do not make up any facts, features, dates, owners, or decisions. If an item is not directly supported by a source fact excerpt, do not include it. Every bullet point or statement must have a citation.
 4. Keep the style premium, high-level, and clean.
+5. Do NOT output a 'Citations' list section at the bottom. Start drafting the text directly.
 
 You must respond with a JSON object matching this schema:
 {{
-  "new_value": "The complete updated Markdown content of the section, fully incorporating the facts.",
+  "new_value": "The complete updated Markdown content of the section, fully incorporating the facts, with inline citations (e.g. Source: [Document Name · Page X]). Do not include a Citations list at the bottom.",
   "reason": "A brief, clear explanation of what changed in this section and why (e.g. 'Timeline updated to October to reflect release delay').",
   "source_provenance": "A concise comma-separated list of the source documents and pages supporting this update."
 }}
@@ -837,7 +899,11 @@ You must respond with a JSON object matching this schema:
                 
                 content = await call_llm(prompt, temperature=0.2, json_mode=True)
                 draft_data = json.loads(content)
-                draft_content = draft_data.get("new_value", "").strip()
+                raw_draft_content = draft_data.get("new_value", "").strip()
+                
+                # Format citations deterministically (deduplicated index footnote style)
+                draft_content = format_citations_deterministically(raw_draft_content)
+                
                 reason = draft_data.get("reason", "").strip()
                 source_provenance = draft_data.get("source_provenance", "").strip()
                 
