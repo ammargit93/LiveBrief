@@ -79,6 +79,31 @@ async def call_llm(prompt: str, temperature: float = 0.0, json_mode: bool = Fals
                 logger.error(f"LLM call failed after {attempt + 1} attempts: {e}")
                 raise e
 
+def get_entity_identifying_text(entity_type: str, value: Dict[str, Any]) -> str:
+    if not isinstance(value, dict):
+        return str(value)
+    
+    if entity_type == "feature":
+        val = value.get("name")
+    elif entity_type == "decision":
+        val = value.get("decision")
+    elif entity_type == "component":
+        val = value.get("name")
+    elif entity_type == "risk":
+        val = value.get("description")
+    elif entity_type == "action_item":
+        val = value.get("description")
+    elif entity_type == "deadline":
+        val = value.get("label")
+    elif entity_type == "owner":
+        val = value.get("name")
+    else:
+        val = None
+        
+    if val and isinstance(val, str):
+        return val.strip()
+    return json.dumps(value)
+
 class AgentState(TypedDict):
     workspace_id: str
     document_id: str
@@ -359,9 +384,9 @@ JSON format:
                             page_num = 1
                         item["page"] = page_num
                         
-                        # Generate embedding for the entity JSON structure to enable pgvector searches
-                        val_str = json.dumps(item)
-                        entity_vector = get_embedding(val_str)
+                        # Generate embedding for the identifying text to enable accurate pgvector searches
+                        identifying_text = get_entity_identifying_text(entity_type, item)
+                        entity_vector = get_embedding(identifying_text)
                         
                         db_entity = Entity(
                             document_id=doc_id,
@@ -422,8 +447,8 @@ async def knowledge_merge_node(state: AgentState) -> AgentState:
         try:
             for new_ent in new_entities:
                 new_type = new_ent["type"]
-                new_val_str = json.dumps(new_ent["value"])
-                new_vec = get_embedding(new_val_str)
+                identifying_text = get_entity_identifying_text(new_type, new_ent["value"])
+                new_vec = get_embedding(identifying_text)
                 
                 # Query existing entities of the same type NOT from the current document, isolated by workspace
                 # Filter by cosine distance <= 0.60 (corresponds to cosine similarity >= 0.40)
@@ -498,37 +523,31 @@ async def conflict_detection_node(state: AgentState) -> AgentState:
             return state
         
         try:
+            added_conflict_keys = set()
             # Batch candidates in groups of 5 to avoid token limits per minute (TPM)
             sub_batch_size = 5
             for i in range(0, len(candidates), sub_batch_size):
                 batch_candidates = candidates[i : i + sub_batch_size]
                 
-                prompt = f"""You are an expert software project intelligence auditor. Compare the following pairs of project records to determine if they contain a logical contradiction (i.e. a conflict).
+                prompt = f"""You are an expert software project intelligence auditor. Compare the following pairs of project records (Record A is older/existing, Record B is newer) to determine if they contain a logical contradiction (i.e. a conflict).
 
-CORE RULE:
-Only flag a conflict (set "conflict": true) when two records refer to the EXACT SAME underlying milestone, task, entity, or system decision AND the EXACT SAME attribute, but contain values that cannot both be true.
+CORE AUDIT FLOW:
+For each pair, determine:
+1. Do both records refer to the EXACT SAME underlying entity, task, milestone, or system decision? (If NO -> NOT a conflict)
+2. Do they refer to the EXACT SAME attribute/detail of that entity/task/milestone/decision? (If NO -> NOT a conflict)
+3. Are the values for that attribute actually incompatible/contradictory? (If NO -> NOT a conflict)
+4. Is this NOT merely missing information, new information, or a later update/superseding decision? (If it IS missing/new/updated info -> NOT a conflict)
+5. If YES to all, classify as conflict: true. Otherwise, conflict: false.
 
 Do NOT flag the following as conflicts (set "conflict": false):
-* Different milestones with different dates (e.g. Internal Alpha Apr 10, Closed Beta May 1, Public Beta Jul 1). These are distinct chronological checkpoints, not a conflict.
-* A milestone or task being mentioned in one document but not the other (missing or null vs a populated value).
-* Different tasks having different owners.
-* Different features or decisions that happen to share keywords (e.g., "polling rejected for the feed" vs "real-time collaborative editing" are separate decisions).
-* Normal chronological relationships such as Design Freeze -> Alpha -> Beta.
-* A later document adding new information that an earlier document didn't contain.
-* A later document intentionally updating or replacing an earlier decision (this is "Updated/Superseded", not a conflict).
+* WebSocket chosen vs long polling rejected: Choices to use one technology and reject/not use another (e.g. Record A chooses WebSocket, Record B rejects long polling) are compatible decisions.
+* Core v1 feature vs deferred feature: Different features scheduled for different versions/releases (e.g., Feature X in v1, Feature Y deferred to v1.1) are NOT conflicts. Only flag a conflict if the EXACT SAME feature has conflicting milestones.
+* Missing information: One record mentioning a constraint or detail while the other does not mention it is NOT a conflict. Absence of a claim must never be interpreted as contradiction.
+* Different milestones: Distinct chronological milestones (e.g., Internal Alpha Apr 10, Closed Beta May 1, Public Beta July 1) are consistent. Only flag dates as conflicting if they specify different dates for the EXACT SAME milestone.
+* Different tasks: Different owners or dates are fine for different tasks. Only flag a conflict after confirming the underlying task is the exact same.
+* Open question/pending decision -> later decision: If an earlier record says something is an open question or pending, and a later record resolves it with a decision, this is an update/resolution, NOT a conflict.
 
-DO flag the following as conflicts (set "conflict": true):
-* Same milestone with conflicting dates (e.g., Closed Beta is May 1 vs Closed Beta is June 15).
-* Same task with conflicting due dates.
-* Same task/entity with different owners.
-* Same system decision with incompatible decisions (e.g., "Use PostgreSQL" vs "Use MongoDB" for the same primary database).
-
-Distinguish between:
-1. "Conflict" -> genuinely incompatible claims about the same attribute of the same task/entity/decision (not including intentional updates or new info).
-2. "Updated/Superseded" -> a later document intentionally changes/updates an earlier decision or date.
-3. "New information" -> one document adds details that another didn't contain.
-
-If it is "Updated/Superseded" or "New information", you MUST set "conflict": false.
+If uncertain, prefer "conflict": false.
 
 Pairs to audit:
 """
@@ -559,7 +578,7 @@ JSON structure:
       "conflict": true | false,
       "category": "Reason category (e.g. Timelines, Component Ownership, Auth mechanism, etc)",
       "severity": "low | medium | high",
-      "explanation": "State clearly why Record B contradicts Record A"
+      "explanation": "State the relationship clearly. If it is a conflict, describe why they contradict (e.g., 'Both records refer to Closed Beta but specify different dates.'). If not a conflict, describe why they are compatible/updated/new (e.g., 'Record A chooses WebSocket while Record B rejects long polling; these are compatible decisions.', 'Record B adds information not present in Record A.', or 'Record B supersedes the earlier decision.')."
     }
   ]
 }
@@ -583,29 +602,35 @@ JSON structure:
                         audit = {"conflict": False}
                         
                     if audit.get("conflict"):
-                        db_conflict = Conflict(
-                            workspace_id=state["workspace_id"],
-                            category=audit.get("category", "General"),
-                            description=audit.get("explanation", "Conflict detected"),
-                            severity=audit.get("severity", "medium"),
-                            existing_entity_id=UUID(ext_ent["id"]),
-                            new_entity_id=UUID(new_ent["id"]),
-                            resolved=False
-                        )
-                        db.add(db_conflict)
-                        await db.flush() # Populate ID
+                        existing_identifying_text = get_entity_identifying_text(ext_ent["type"], ext_ent["value"]).lower()
+                        new_identifying_text = get_entity_identifying_text(new_ent["type"], new_ent["value"]).lower()
+                        conflict_key = (new_ent["type"], existing_identifying_text, new_identifying_text)
                         
-                        detected_conflicts.append({
-                            "id": str(db_conflict.id),
-                            "category": db_conflict.category,
-                            "description": db_conflict.description,
-                            "severity": db_conflict.severity
-                        })
-                        
-                        # Mark sections affected by this category
-                        sections = category_to_sections.get(new_ent["type"], [])
-                        for s in sections:
-                            affected_sections.add(s)
+                        if conflict_key not in added_conflict_keys:
+                            added_conflict_keys.add(conflict_key)
+                            db_conflict = Conflict(
+                                workspace_id=state["workspace_id"],
+                                category=audit.get("category", "General"),
+                                description=audit.get("explanation", "Conflict detected"),
+                                severity=audit.get("severity", "medium"),
+                                existing_entity_id=UUID(ext_ent["id"]),
+                                new_entity_id=UUID(new_ent["id"]),
+                                resolved=False
+                            )
+                            db.add(db_conflict)
+                            await db.flush() # Populate ID
+                            
+                            detected_conflicts.append({
+                                "id": str(db_conflict.id),
+                                "category": db_conflict.category,
+                                "description": db_conflict.description,
+                                "severity": db_conflict.severity
+                            })
+                            
+                            # Mark sections affected by this category
+                            sections = category_to_sections.get(new_ent["type"], [])
+                            for s in sections:
+                                affected_sections.add(s)
                             
                 # Sleep briefly between sub-batches to be kind to Groq rate limits
                 if i + sub_batch_size < len(candidates):
@@ -712,10 +737,10 @@ Please draft a clean, professional, and well-structured Markdown version of Sect
 
 GROUNDING RULES:
 1. Every claim, feature, tech decision, deadline, component, or item you add/update MUST be cited from the source facts.
-2. For every claim, append a clickable citation link exactly in one of the following formats depending on the file:
-   - For PDF documents or documents with a page number, use: Source: [Document Name · Page X](http://localhost:8000/documents/{{doc_id}}/download) where X is the page number from the corresponding 'Page' fact.
-   - For other documents, use: Source: [Document Name](http://localhost:8000/documents/{{doc_id}}/download)
-   Crucial: Do not wrap the citation in parentheses. Output exactly: Source: [Document Name · Page X](...) or Source: [Document Name](...).
+2. For every claim, append a citation exactly in one of the following formats depending on the file:
+   - For PDF documents or documents with a page number, use: Source: [Document Name · Page X] where X is the page number from the corresponding 'Page' fact.
+   - For other documents, use: Source: [Document Name]
+   Crucial: Output exactly: Source: [Document Name · Page X] or Source: [Document Name]. Do not include any URL links or parentheses containing a URL.
 3. STRICT HACK PREVENTION: Do not make up any facts, features, dates, owners, or decisions. If an item is not directly supported by a source fact excerpt, do not include it. Every bullet point or statement must have a citation.
 4. Keep the style premium, high-level, and clean.
 5. Do not add any introductory or concluding comments. Start directly with the updated Markdown content.

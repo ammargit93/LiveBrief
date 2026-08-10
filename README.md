@@ -1,99 +1,189 @@
 # LiveBrief - Project Intelligence Agent
 
-LiveBrief is an agentic document intelligence system that reconciles disparate software engineering documents (PRDs, meeting notes, architecture designs, ADRs) into a unified, living **Project Brief** source of truth. 
+LiveBrief is a state-of-the-art agentic document intelligence system that automatically reconciles disparate, unstructured software engineering documents (such as PRDs, meeting notes, architecture designs, and ADRs) into a single, cohesive, living **Project Brief** source of truth.
 
-The application utilizes **local open-source sentence embeddings**, a **PostgreSQL Vector Database (pgvector)**, and **large language models (LLMs)** to automatically categorize documents, extract key structured entities (features, decisions, timelines), highlight structural contradictions, and recommend versioned brief updates for human approval.
+The application leverages **local open-source sentence embeddings**, a **PostgreSQL Vector Database (pgvector)**, and **large language models (LLMs)** to automatically categorize documents, extract key structured entities (features, decisions, timelines), highlight structural contradictions, and recommend versioned brief updates for human approval.
 
 ---
 
-## 🏗️ System Architecture & Modular Layout
+## 🏗️ System Architecture & Data Flow
 
-The backend codebase is refactored into a clean, modular structure following enterprise separation of concerns:
+LiveBrief follows a clean, modular architectural layout separating route handlers, core state machines, vector processing utilities, and schema definitions.
+
+### Component Architecture Diagram
+
+```mermaid
+graph TB
+    subgraph Frontend ["React & Vite Frontend"]
+        UI["Interactive Brief / Review Dashboard"]
+    end
+
+    subgraph Backend ["FastAPI Application Server"]
+        R_Docs["Document Router"]
+        R_Conf["Conflict Router"]
+        R_Rev["Review Router"]
+        R_Sum["Summary Router"]
+        
+        Parser["Parser Service"]
+        Embedder["Embedding Service"]
+        Agent["Agent Service"]
+        Exporter["Export Service"]
+    end
+
+    subgraph DB ["PostgreSQL Vector Database"]
+        Tables[("Relational Tables")]
+        VectorIndex[("pgvector Embeddings Index")]
+    end
+
+    UI <-->|API Requests / JSON| Backend
+    R_Docs -->|Trigger Job| Agent
+    Agent -->|Extract Text & Chunk| Parser
+    Agent -->|Compute Embeddings| Embedder
+    Agent -->|CRUD Entities / Conflicts / Drafts| DB
+    Embedder <-->|Local SentenceTransformer| VectorIndex
+    Exporter -->|Build Document Briefs| DB
+```
+
+### Directory Structure
 
 ```text
 backend/app/
 ├── core/
-│   ├── config.py             # App configurations (ports, local path, API URLs, model parameters)
-│   └── database.py           # Async engine setup & session maker (SQLAlchemy asyncpg)
+│   ├── config.py             # App configurations (ports, path mappings, model names)
+│   └── database.py           # Async engine & session pool (SQLAlchemy + asyncpg)
 ├── models/
-│   ├── __init__.py           # Exposes database models
-│   └── models.py             # Database models mapping tables (Workspace, Document, Entity, etc.)
+│   ├── __init__.py           # Model index
+│   └── models.py             # SQLAlchemy models (Workspace, Document, Entity, Conflict, etc.)
 ├── schemas/
-│   ├── __init__.py           # Exposes validation schemas
-│   └── schemas.py            # Pydantic input/output schemas for API validations
+│   ├── __init__.py           # Schema index
+│   └── schemas.py            # Pydantic schemas for API payload validation & serialization
 ├── services/
-│   ├── __init__.py           # Exposes public service APIs
-│   ├── agent_service.py      # Node-based pipeline agent workflow (Classification -> Drafting)
-│   ├── embedding_service.py  # Local Hugging Face all-MiniLM-L6-v2 embedder (384-dimension vectors)
+│   ├── __init__.py           # Service index
+│   ├── agent_service.py      # Core agent state machine (Classification -> Brief Drafting)
+│   ├── embedding_service.py  # Local MiniLM sentence embedder (384-dimension vector generation)
 │   ├── export_service.py     # PDF & DOCX generator from project brief sections
-│   └── parser_service.py     # Document text extraction (.md, .pdf, .docx) & contextual chunker
+│   └── parser_service.py     # Multi-format parser (.md, .pdf, .docx) & contextual chunker
 └── routers/
-    ├── __init__.py           # Mounts and registers all sub-routers
-    ├── deps.py               # Shared API dependencies (e.g. get_active_workspace_id)
-    ├── workspaces.py         # Workspace retrieval & template creation endpoints
+    ├── __init__.py           # APIRouter index and registry
+    ├── deps.py               # Shared API dependencies (e.g. Workspace extraction)
+    ├── workspaces.py         # Workspace retrieval & template configuration
     ├── documents.py          # Document upload & ingestion trigger endpoints
-    ├── project_summary.py    # Summary brief sections retrieval & export endpoints
-    ├── conflicts.py          # Conflict logs retrieval endpoints
+    ├── project_summary.py    # Summary brief section management & exports
+    ├── conflicts.py          # Conflict logs & details endpoints
     ├── reviews.py            # Recommended drafts approval/rejection endpoints
-    ├── timeline.py           # activity logs & reverse timeline audit logs endpoints
-    └── jobs.py               # Real-time pipeline status retrieval endpoints
+    ├── timeline.py           # Audit events & reverse chronological activity logs
+    └── jobs.py               # Pipeline state & execution tracking endpoints
 ```
 
 ---
 
 ## 🧬 Agentic Pipeline Workflow
 
-When a file is uploaded, a background task triggers the agent pipeline runner ([agent_service.py](file:///c:/Projects/Python-projects/LiveBrief/backend/app/services/agent_service.py)). The pipeline transitions through 5 distinct nodes in a LangGraph-like state flow:
+When a file is uploaded, a background task initiates a resumable state-transition pipeline through five distinct nodes (implemented as a LangGraph-like state flow):
 
 ```mermaid
-graph TD
-    A[Upload File] --> B[Node 1: Classification]
-    B --> C[Node 2: Fact Extraction]
-    C --> D[Node 3: Knowledge Merge]
-    D --> E[Node 4: Conflict Detection]
-    E --> F[Node 5: Brief Drafting]
-    F --> G[Pending Review Queue]
+sequenceDiagram
+    autonumber
+    actor User
+    participant Router as API Router
+    participant Agent as Agent Service
+    participant DB as PostgreSQL
+    participant LLM as Chat LLM
+
+    User->>Router: Upload Document
+    Router->>Agent: Run Agent Pipeline
+    activate Agent
+    
+    rect rgb(240, 240, 240)
+        note right of Agent: Node 1: Classification
+        Agent->>LLM: Classify (First 3k chars)
+        LLM-->>Agent: Type & Confidence JSON
+        Agent->>DB: Update Document status & type
+    end
+
+    rect rgb(230, 240, 250)
+        note right of Agent: Node 2: Information Extraction
+        Agent->>Agent: Parse & Chunk Content
+        Agent->>LLM: Extract structured facts
+        LLM-->>Agent: Features, Decisions, Milestones, Owners
+        Agent->>Agent: Generate identifying text embeddings
+        Agent->>DB: Save Entities & Chunks
+    end
+
+    rect rgb(220, 240, 240)
+        note right of Agent: Node 3: Knowledge Merge
+        Agent->>DB: Query similar active entities in workspace (cosine similarity >= 0.40)
+        DB-->>Agent: Matching existing entities
+    end
+
+    rect rgb(240, 240, 230)
+        note right of Agent: Node 4: Conflict Detection
+        Agent->>LLM: Compare matched pairs for contradictions
+        LLM-->>Agent: Audit Results (Conflict status, explanation)
+        Agent->>Agent: Deduplicate equivalent conflicts in batch
+        Agent->>DB: Save detected Conflicts
+    end
+
+    rect rgb(240, 230, 240)
+        note right of Agent: Node 5: Brief Drafting
+        Agent->>DB: Fetch all active entities for affected sections
+        Agent->>LLM: Draft updated Markdown content (Grounding/Citations)
+        LLM-->>Agent: Section Draft Markdown
+        Agent->>DB: Create Review Task (Status: pending)
+    end
+
+    Agent-->>Router: Job Pending Review
+    deactivate Agent
+    Router-->>User: Success response (Waiting for review)
 ```
 
-### Node 1: Classification
-- **Action**: Extracts the first 3,000 characters of the document and asks the LLM to classify the document type.
-- **Supported Classes**: `PRD`, `Architecture`, `Meeting Notes`, `ADR`, `Sprint Planning`, `Release Notes`, `API Specification`, or `Unknown`.
-- **Database Action**: Saves the document classification type and confidence score to the `documents` table.
+---
 
-### Node 2: Information Extraction
-- **Action**: Divides the document text into contextual paragraphs using the custom chunker. Chunks are batched into groups of 3 (to stay within free-tier API rate limits).
-- **Extraction**: The LLM extracts key entities into 7 categories (`features`, `technical_decisions`, `components`, `risks`, `action_items`, `deadlines`, `owners`). For every extracted entity, a direct text sentence is saved in `source_excerpt`.
-- **Embedding Generation**: Generates 384-dimension vectors locally using the Hugging Face `all-MiniLM-L6-v2` model for:
-  - Each raw document text chunk.
-  - Each extracted entity (by stringifying its JSON structure).
-- **Database Action**: Persists chunks in the `embeddings` table and extracted facts in the `entities` table (both storing their vector representations in `pgvector` columns).
+## 🔍 Detailed Component Deep-Dive
 
-### Node 3: Knowledge Merge (Retrieval-Augmented Verification)
-- **Action**: Compares the newly extracted entities against existing entities in the same workspace.
-- **pgvector Retrieval**: Instead of looping through all database records, the agent queries PostgreSQL directly using pgvector's cosine distance operator:
-  ```sql
-  SELECT * FROM entities 
-  WHERE type = :new_type AND document_id != :current_doc_id 
-  ORDER BY embedding <=> :new_embedding
-  LIMIT ...
-  ```
-- **Filter**: Keeps entity pairs where the cosine distance is $\le 0.60$ (equivalent to cosine similarity $\ge 0.40$).
-- **Database Action**: Passes matching candidate pairs to the next node.
+### 1. Contextual Extraction & Embedding Strategy
+Unlike naive RAG systems which embed whole raw paragraphs directly, LiveBrief extracts structured details first. The system:
+- Isolates information into seven schema categories: `features`, `technical_decisions`, `components`, `risks`, `action_items`, `deadlines`, and `owners`.
+- Generates vectors based on **identifying text** (e.g. decision title, feature name, milestone label) instead of stringified raw JSON or rationales. This ensures pgvector cosine distance matches entities strictly on *what they represent* rather than *why they were chosen* or *who owns them*.
 
-### Node 4: Conflict Detection
-- **Action**: Feeds each matched candidate pair into the LLM. The auditor determines if they contain flat contradictions (e.g. conflicting sprint deadlines, opposing system designs, or different owners).
-- **Database Action**: If a conflict is verified, the agent inserts a record into the `conflicts` table and marks the corresponding brief section (e.g. `Timeline`, `Architecture`) as affected.
+### 2. High-Fidelity Conflict Auditor
+The conflict detection node resolves false positives by performing a strict logical decision tree. 
 
-### Node 5: Brief Drafting
-- **Action**: Identifies which of the 8 standard brief sections are affected. For each affected section, the agent fetches **all active workspace entities** matching that category from the database.
-- **Drafting**: The LLM technical writer merges existing content with the new database entities to generate a clean, consolidated Markdown draft.
-- **Database Action**: Creates a row in the `reviews` table containing the `old_value`, `new_value`, and the target section, keeping it in `pending` status until human approval.
+Before flagging a pair of records as a conflict, it verifies:
+```text
+Same underlying entity/task/milestone/decision?
+                     ↓ (Yes)
+              Same attribute?
+                     ↓ (Yes)
+        Are the values actually incompatible?
+                     ↓ (Yes)
+Is this NOT merely missing information/new information/an update?
+                     ↓ (Yes)
+               [ CONFLICT ]
+```
+
+#### Resolved False Positive Scenarios
+- **WebSocket chosen vs long polling rejected**: Recognized as complementary/compatible decisions.
+- **Core v1 feature vs deferred feature**: Distinct features (e.g. Feat A in v1, Feat B in v1.1) are not conflicts.
+- **Missing information**: The omission of a detail in one document is never treated as a contradiction.
+- **Different milestones**: Sequential checkpoints (Internal Alpha, Closed Beta, Public Beta) are chronologically consistent.
+- **Different tasks**: Different owners and deadlines are allowed for different tasks.
+- **Open questions resolved later**: When an open question or pending decision in an older document is resolved in a newer document, it is classified as an update, not a contradiction.
+
+### 3. Duplicate Conflict Deduplication
+To prevent users from being overwhelmed by the same logical issue multiple times, candidate matches are grouped and deduplicated before insertion using a composite key: `(entity_type, existing_identifying_text, new_identifying_text)`. A single logical issue results in one conflict log finding.
+
+### 4. Human-In-The-Loop Review Queue
+Draft updates are never written directly to the project summary brief. Instead:
+- Proposed changes are saved as `Review` tasks.
+- Committing updates requires explicit User approval via the `/review/{id}/approve` endpoint, which increments the version of the corresponding section in `project_summary` and appends an entry to the audit timeline.
+- Citations are formatted cleanly (e.g., `Source: [Document Name · Page X]`) for strict traceability.
 
 ---
 
 ## 🗄️ Database Entity-Relationship Diagram
 
-The application uses PostgreSQL with the `vector` extension enabled.
+LiveBrief utilizes a relational schema optimized with the `pgvector` extension for semantic search capabilities:
 
 ```mermaid
 erDiagram
@@ -132,7 +222,7 @@ erDiagram
     Entity {
         UUID id PK
         UUID document_id FK
-        String type "feature | decision | component | etc."
+        String type
         JSONB value
         Text source_excerpt
         Vector embedding "pgvector(384)"
@@ -152,7 +242,7 @@ erDiagram
     ProjectSummary {
         UUID id PK
         UUID workspace_id FK
-        String section "Overview | Architecture | Features | etc."
+        String section
         Text content
         Integer version
         UUID last_review_id FK
@@ -161,10 +251,10 @@ erDiagram
     Review {
         UUID id PK
         UUID workspace_id FK
-        JSONB proposed_change "old_value, new_value, target_section"
+        JSONB proposed_change
         UUID conflict_id FK
-        String status "pending | approved | rejected"
-        Text reason "rejection reason"
+        String status
+        Text reason
         DateTime created_at
         DateTime resolved_at
     }
@@ -184,7 +274,7 @@ erDiagram
         UUID document_id FK
         UUID batch_id
         String current_node
-        String status "running | complete | failed"
+        String status
         Text error
         DateTime started_at
         DateTime updated_at
@@ -196,35 +286,42 @@ erDiagram
 ## 🛠️ Local Installation & Development
 
 ### 1. Database Setup
-Ensure PostgreSQL is running and has the `pgvector` extension installed. If running inside Docker (standard setup):
+Start a PostgreSQL 16 container with `pgvector` installed:
 ```bash
-# Pull and start Postgres 16 container with pgvector built-in
 docker run --name postgres -e POSTGRES_PASSWORD=1234 -e POSTGRES_USER=ammar -e POSTGRES_DB=livebrief -p 5432:5432 -d pgvector/pgvector:pg16
 ```
 
 ### 2. Backend Setup
-Use Python 3.11+ and `uv` package manager for fast dependency installations:
-```bash
-# Install package dependencies and sync virtual env
-uv sync
-
-# Run database table initialization (creates extension and tables)
-uv run python -m backend.app.init_db
-
-# Start the FastAPI backend server
-uv run uvicorn backend.app.main:app --reload --port 8000
-```
+1. Ensure Python 3.11+ is installed.
+2. Configure environmental variables in a local `.env` file:
+   ```env
+   DATABASE_URL=postgresql+asyncpg://ammar:1234@localhost:5432/livebrief
+   GROQ_API_KEY=your-groq-api-key
+   GROQ_MODEL=llama3-70b-8192
+   ```
+3. Synchronize dependencies using `uv`:
+   ```bash
+   uv sync
+   ```
+4. Run table initialization:
+   ```bash
+   uv run python -m backend.app.init_db
+   ```
+5. Start the FastAPI backend server:
+   ```bash
+   uv run uvicorn backend.app.main:app --reload --port 8000
+   ```
 
 ### 3. Frontend Setup
-Navigate to the frontend directory and start the Vite development server:
+Navigate to the frontend directory and launch the Vite development server:
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-### 4. Running Tests
-Run the unit and E2E mock pipeline test suite:
+### 4. Running the Test Suite
+To execute the mock and unit test suites:
 ```bash
 uv run python -m pytest
 ```

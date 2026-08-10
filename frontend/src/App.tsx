@@ -895,20 +895,69 @@ export default function App() {
                     const steps = [
                       { id: 'upload', label: 'File Upload' },
                       { id: 'classification', label: 'Classification' },
-                      { id: 'extraction', label: 'Fact Extract' },
-                      { id: 'knowledge_merge', label: 'Merge Engine' },
+                      { id: 'planner', label: 'Planner Node' },
+                      { id: 'extraction', label: 'Fact Extraction' },
+                      { id: 'knowledge_merge', label: 'Knowledge Merge' },
                       { id: 'conflict_detection', label: 'Conflict Check' },
-                      { id: 'generate_brief_updates', label: 'Draft Brief' }
+                      { id: 'generate_brief_updates', label: 'Brief Drafting' }
                     ];
 
-                    const currentNodeIndex = steps.findIndex(s => s.id === job.current_node);
-                    
+                    const associatedDoc = documents.find(d => d.id === job.document_id);
+                    const filename = associatedDoc ? associatedDoc.filename : 'Unknown Document';
+
+                    const getStepStatus = (stepId: string) => {
+                      const currentNodeIndex = steps.findIndex(s => s.id === job.current_node);
+                      const stepIndex = steps.findIndex(s => s.id === stepId);
+                      
+                      // Check if skipped by planner
+                      if (job.planner_decision) {
+                        const decision = job.planner_decision;
+                        if (stepId === 'extraction' && (!decision.entity_types_to_extract || decision.entity_types_to_extract.length === 0)) {
+                          return 'skipped';
+                        }
+                        if ((stepId === 'knowledge_merge' || stepId === 'conflict_detection') && decision.requires_conflict_check === false) {
+                          return 'skipped';
+                        }
+                      }
+                      
+                      // If the job failed at this node
+                      if (job.status === 'failed' && job.current_node === stepId) {
+                        return 'failed';
+                      }
+                      
+                      // If the job is running at this node
+                      if (job.status === 'running' && job.current_node === stepId) {
+                        return 'running';
+                      }
+                      
+                      // If the node is completed
+                      if (job.status === 'complete') {
+                        return 'completed';
+                      }
+                      
+                      if (currentNodeIndex > stepIndex) {
+                        return 'completed';
+                      }
+                      
+                      if (job.current_node === stepId) {
+                        if (job.status === 'waiting_for_review') {
+                          return 'waiting_for_review';
+                        }
+                        return 'completed';
+                      }
+                      
+                      return 'pending';
+                    };
+
                     return (
-                      <div key={job.id} className="p-4 bg-slate-50 border border-slate-200 rounded-none space-y-3">
+                      <div key={job.id} className="p-4 bg-slate-50 border border-slate-200 rounded-none space-y-4">
+                        
+                        {/* Job Meta Header */}
                         <div className="flex justify-between items-center text-xs">
                           <div>
-                            <span className="font-bold text-slate-900">Job {job.id.substring(0, 8)}...</span>
-                            <span className="text-slate-500 ml-2">Started {new Date(job.started_at).toLocaleString()}</span>
+                            <span className="font-bold text-slate-900">Run {job.id.substring(0, 8)}...</span>
+                            <span className="text-slate-400 font-medium ml-2">Document: <span className="font-mono text-slate-800 font-semibold">{filename}</span></span>
+                            <span className="text-slate-400 ml-2">| Started {new Date(job.started_at).toLocaleString()}</span>
                           </div>
                           <span className={`text-[9px] font-bold uppercase px-2 py-0.5 border ${
                             job.status === 'running' ? 'bg-blue-50 border-blue-200 text-blue-800 animate-pulse' :
@@ -926,29 +975,123 @@ export default function App() {
                           </div>
                         )}
 
-                        {/* Node grid layout */}
-                        <div className="grid grid-cols-2 md:grid-cols-6 gap-2 pt-2 border-t border-slate-200">
-                          {steps.map((step, idx) => {
-                            const isCompleted = idx < currentNodeIndex || (idx === currentNodeIndex && job.status === 'complete');
-                            const isCurrent = idx === currentNodeIndex && job.status === 'running';
-                            const isWaiting = idx > currentNodeIndex && job.status !== 'waiting_for_review';
-                            const isPendingReview = idx === currentNodeIndex && job.status === 'waiting_for_review';
-
-                            let stepStyle = "border-slate-200 text-slate-400 bg-white";
-                            if (isCompleted) stepStyle = "border-green-300 text-green-700 bg-green-50/50";
-                            if (isCurrent) stepStyle = "border-blue-400 text-blue-700 bg-blue-50 font-bold";
-                            if (isPendingReview) stepStyle = "border-orange-300 text-orange-700 bg-orange-50 font-semibold";
-
-                            return (
-                              <div key={step.id} className={`p-2 border text-center text-[10px] rounded-none ${stepStyle}`}>
-                                <div className="font-semibold">{step.label}</div>
-                                <div className="text-[8px] mt-0.5 font-normal">
-                                  {isCompleted && "✓ Finished"}
-                                  {isCurrent && "Processing..."}
-                                  {isPendingReview && "Pending Review"}
-                                  {isWaiting && "Waiting"}
+                        {/* Planner Decision Panel */}
+                        {job.planner_decision && (
+                          <div className="bg-white border border-slate-200 p-3 space-y-2 text-xs">
+                            <div className="flex items-center gap-2 font-bold text-slate-800 text-[10px] uppercase tracking-wide">
+                              <span className="bg-slate-900 text-white px-1.5 py-0.5 font-mono text-[8px]">PLAN</span>
+                              <span>Adaptive Pipeline Plan & Reasoning</span>
+                            </div>
+                            <p className="text-[10px] text-slate-600 leading-relaxed font-sans italic">
+                              "{job.planner_decision.reasoning}"
+                            </p>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3 pt-2 border-t border-slate-100 text-[9px]">
+                              <div>
+                                <span className="text-slate-400 block font-semibold uppercase tracking-wider text-[8px]">Extract Entities</span>
+                                <div className="flex flex-wrap gap-1 mt-1">
+                                  {job.planner_decision.entity_types_to_extract && job.planner_decision.entity_types_to_extract.length > 0 ? (
+                                    job.planner_decision.entity_types_to_extract.map((t: string) => (
+                                      <span key={t} className="bg-slate-100 border border-slate-200 text-slate-700 px-1 py-0.2 font-semibold">
+                                        {t}
+                                      </span>
+                                    ))
+                                  ) : (
+                                    <span className="bg-amber-50 text-amber-800 px-1 py-0.2 font-semibold border border-amber-200">
+                                      Skipped
+                                    </span>
+                                  )}
                                 </div>
                               </div>
+                              <div>
+                                <span className="text-slate-400 block font-semibold uppercase tracking-wider text-[8px]">Affected Sections</span>
+                                <div className="flex flex-wrap gap-1 mt-1">
+                                  {job.planner_decision.affected_sections && job.planner_decision.affected_sections.length > 0 ? (
+                                    job.planner_decision.affected_sections.map((s: string) => (
+                                      <span key={s} className="bg-slate-100 border border-slate-200 text-slate-700 px-1 py-0.2 font-semibold">
+                                        {s}
+                                      </span>
+                                    ))
+                                  ) : (
+                                    <span className="text-slate-500 italic">None</span>
+                                  )}
+                                </div>
+                              </div>
+                              <div>
+                                <span className="text-slate-400 block font-semibold uppercase tracking-wider text-[8px]">Conflict Auditing</span>
+                                <div className="mt-1">
+                                  {job.planner_decision.requires_conflict_check ? (
+                                    <span className="bg-green-50 border border-green-200 text-green-700 px-1.5 py-0.2 font-bold uppercase text-[8px]">
+                                      Enabled
+                                    </span>
+                                  ) : (
+                                    <span className="bg-amber-50 border border-amber-200 text-amber-700 px-1.5 py-0.2 font-bold uppercase text-[8px]">
+                                      Bypassed
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                              <div>
+                                <span className="text-slate-400 block font-semibold uppercase tracking-wider text-[8px]">Timeline Updates</span>
+                                <div className="mt-1">
+                                  {job.planner_decision.requires_timeline_update ? (
+                                    <span className="bg-green-50 border border-green-200 text-green-700 px-1.5 py-0.2 font-bold uppercase text-[8px]">
+                                      Enabled
+                                    </span>
+                                  ) : (
+                                    <span className="bg-slate-150 border border-slate-250 text-slate-500 px-1.5 py-0.2 font-bold uppercase text-[8px]">
+                                      Disabled
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Interactive Branching Node Flow */}
+                        <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-200">
+                          {steps.map((step, idx) => {
+                            const status = getStepStatus(step.id);
+                            
+                            let stepStyle = "";
+                            let labelSuffix = "";
+                            if (status === 'completed') {
+                              stepStyle = "border-green-300 text-green-700 bg-green-50/50";
+                              labelSuffix = "✓ Finished";
+                            } else if (status === 'skipped') {
+                              stepStyle = "border-slate-200 border-dashed text-slate-400 bg-slate-100/60";
+                              labelSuffix = "⤏ Bypassed";
+                            } else if (status === 'running') {
+                              stepStyle = "border-blue-400 text-blue-700 bg-blue-50 animate-pulse font-bold";
+                              labelSuffix = "Active Node";
+                            } else if (status === 'failed') {
+                              stepStyle = "border-red-300 text-red-700 bg-red-50 font-bold";
+                              labelSuffix = "✗ Error Node";
+                            } else if (status === 'waiting_for_review') {
+                              stepStyle = "border-orange-300 text-orange-700 bg-orange-50 font-semibold";
+                              labelSuffix = "Review Queue";
+                            } else {
+                              stepStyle = "border-slate-200 text-slate-400 bg-white";
+                              labelSuffix = "Waiting";
+                            }
+
+                            return (
+                              <React.Fragment key={step.id}>
+                                <div className={`p-2 border flex-1 min-w-[110px] text-center text-[10px] rounded-none ${stepStyle}`}>
+                                  <div className="font-bold text-[9px] uppercase tracking-wider text-slate-400 mb-0.5">{step.id}</div>
+                                  <div className="font-semibold text-[10px]">{step.label}</div>
+                                  <div className="text-[8px] mt-1 font-normal font-mono opacity-80">
+                                    {labelSuffix}
+                                  </div>
+                                </div>
+                                {idx < steps.length - 1 && (
+                                  <span className={`hidden md:inline text-xs font-bold ${
+                                    status === 'completed' ? 'text-green-500' : 'text-slate-300'
+                                  }`}>
+                                    →
+                                  </span>
+                                )}
+                              </React.Fragment>
                             );
                           })}
                         </div>
