@@ -104,6 +104,89 @@ def get_entity_identifying_text(entity_type: str, value: Dict[str, Any]) -> str:
         return val.strip()
     return json.dumps(value)
 
+def format_entity_value(entity_type: str, value: Dict[str, Any]) -> str:
+    if not isinstance(value, dict):
+        return str(value)
+        
+    parts = []
+    if entity_type == "feature":
+        name = value.get("name")
+        desc = value.get("description")
+        if name:
+            parts.append(f"Feature: {name}")
+        if desc:
+            parts.append(f"Description: {desc}")
+            
+    elif entity_type == "decision":
+        decision = value.get("decision")
+        rationale = value.get("rationale")
+        status = value.get("status")
+        if decision:
+            parts.append(f"Decision: {decision}")
+        if status:
+            parts.append(f"Status: {status}")
+        if rationale:
+            parts.append(f"Rationale: {rationale}")
+            
+    elif entity_type == "component":
+        name = value.get("name")
+        desc = value.get("description")
+        if name:
+            parts.append(f"Component: {name}")
+        if desc:
+            parts.append(f"Description: {desc}")
+            
+    elif entity_type == "risk":
+        desc = value.get("description")
+        severity = value.get("severity")
+        mitigation = value.get("mitigation")
+        if desc:
+            parts.append(f"Risk: {desc}")
+        if severity:
+            parts.append(f"Severity: {severity}")
+        if mitigation:
+            parts.append(f"Mitigation: {mitigation}")
+            
+    elif entity_type == "action_item":
+        desc = value.get("description")
+        owner = value.get("owner")
+        due = value.get("due_date")
+        if desc:
+            parts.append(f"Action Item: {desc}")
+        if owner:
+            parts.append(f"Owner: {owner}")
+        if due:
+            parts.append(f"Due Date: {due}")
+            
+    elif entity_type == "deadline":
+        label = value.get("label")
+        date = value.get("date")
+        if label:
+            parts.append(f"Deadline: {label}")
+        if date:
+            parts.append(f"Date: {date}")
+            
+    elif entity_type == "owner":
+        name = value.get("name")
+        role = value.get("role")
+        area = value.get("area")
+        if name:
+            parts.append(f"Owner: {name}")
+        if role:
+            parts.append(f"Role: {role}")
+        if area:
+            parts.append(f"Area: {area}")
+            
+    else:
+        for k, v in value.items():
+            if k != "page":
+                parts.append(f"{k.capitalize()}: {v}")
+                
+    if not parts:
+        return str(value)
+        
+    return ", ".join(parts)
+
 class AgentState(TypedDict):
     workspace_id: str
     document_id: str
@@ -653,44 +736,46 @@ JSON structure:
             
     return state
 
-# Node 5: Generate Project Brief Updates
+# Node 5: Generate Project Brief Updates (Incremental Diff System)
 async def generate_brief_updates_node(state: AgentState) -> AgentState:
     run_id = state["run_id"]
     doc_id = state["document_id"]
-    logger.info(f"[{run_id}] Starting generate brief updates node")
+    logger.info(f"[{run_id}] Starting generate brief updates node (incremental diff system)")
     
     async with async_session_maker() as db:
         await update_job_node(db, run_id, "generate_brief_updates")
         
-        sections = state["sections_to_draft"]
-        
-        # 1. Filter sections based on planner's affected_sections
-        planner_sections = state["planner_decision"].get("affected_sections", [])
-        sections = [s for s in sections if s in planner_sections]
+        # 1. The Planner determines affected sections
+        sections = list(set(state["planner_decision"].get("affected_sections", [])))
         
         # 2. Exclude Timeline if requires_timeline_update is False
         if not state["planner_decision"].get("requires_timeline_update", True):
             sections = [s for s in sections if s != "Timeline"]
             
         if not sections:
-            logger.info(f"[{run_id}] No sections to draft based on planner decision.")
+            logger.info(f"[{run_id}] No affected sections to draft based on planner decision.")
             await update_job_node(db, run_id, "generate_brief_updates", status="complete")
             return state
-        
+            
         try:
-            # Load the current document
             doc = await db.get(Document, doc_id)
             doc_name = doc.filename if doc else "Document"
             
+            reviews_created = False
+            
             for section_name in sections:
-                # 1. Fetch current content of the section if it exists, isolated by workspace and ordering by version descending
-                stmt = select(ProjectSummary).where(ProjectSummary.workspace_id == state["workspace_id"]).where(ProjectSummary.section == section_name).order_by(desc(ProjectSummary.version))
+                # Fetch the latest version row of this section to get current content
+                stmt = (
+                    select(ProjectSummary)
+                    .where(ProjectSummary.workspace_id == state["workspace_id"])
+                    .where(ProjectSummary.section == section_name)
+                    .order_by(desc(ProjectSummary.version))
+                )
                 res = await db.execute(stmt)
                 summary_section = res.scalars().first()
                 existing_content = summary_section.content if summary_section else "(This section is currently empty.)"
                 
-                # 2. Collect all entities that belong to this section category
-                # Mapping section to entity type
+                # Collect entities belonging to this section category
                 section_to_entity_types = {
                     "Project Overview": ["owner", "action_item"],
                     "Architecture": ["component"],
@@ -704,8 +789,7 @@ async def generate_brief_updates_node(state: AgentState) -> AgentState:
                 
                 ent_types = section_to_entity_types.get(section_name, [])
                 
-                # Fetch both existing active entities and the new ones for this category, isolated by workspace
-                # Join Document and eager-load it so we can access document name/id in prompt formatting
+                # Fetch workspace entities of these types
                 ent_stmt = (
                     select(Entity)
                     .options(joinedload(Entity.document))
@@ -717,11 +801,10 @@ async def generate_brief_updates_node(state: AgentState) -> AgentState:
                 all_entities = ent_res.scalars().all()
                 
                 entities_str = "\n".join([
-                    f"- {ent.type.upper()}: {json.dumps(ent.value)} (Source Excerpt: \"{ent.source_excerpt}\", Document Name: '{ent.document.filename}', Document ID: {ent.document.id}, Page: {ent.value.get('page', 1)})"
+                    f"- {ent.type.upper()}: {format_entity_value(ent.type, ent.value)} (Source Excerpt: \"{ent.source_excerpt}\", Document Name: '{ent.document.filename}', Document ID: {ent.document.id}, Page: {ent.value.get('page', 1)})"
                     for ent in all_entities
                 ])
                 
-                # Ask LLM to draft the updated section content with strict grounding and citations
                 prompt = f"""You are a professional technical writer and system architect. Update the Section '{section_name}' of our software project brief.
 Here is the current content of Section '{section_name}':
 \"\"\"
@@ -733,7 +816,7 @@ Here are the extracted structured facts and decisions we must incorporate (both 
 {entities_str}
 \"\"\"
 
-Please draft a clean, professional, and well-structured Markdown version of Section '{section_name}'.
+Please draft an updated Markdown version of Section '{section_name}', provide a brief reason for the change, and list the source provenance (document names and page numbers).
 
 GROUNDING RULES:
 1. Every claim, feature, tech decision, deadline, component, or item you add/update MUST be cited from the source facts.
@@ -743,30 +826,50 @@ GROUNDING RULES:
    Crucial: Output exactly: Source: [Document Name · Page X] or Source: [Document Name]. Do not include any URL links or parentheses containing a URL.
 3. STRICT HACK PREVENTION: Do not make up any facts, features, dates, owners, or decisions. If an item is not directly supported by a source fact excerpt, do not include it. Every bullet point or statement must have a citation.
 4. Keep the style premium, high-level, and clean.
-5. Do not add any introductory or concluding comments. Start directly with the updated Markdown content.
+
+You must respond with a JSON object matching this schema:
+{{
+  "new_value": "The complete updated Markdown content of the section, fully incorporating the facts.",
+  "reason": "A brief, clear explanation of what changed in this section and why (e.g. 'Timeline updated to October to reflect release delay').",
+  "source_provenance": "A concise comma-separated list of the source documents and pages supporting this update."
+}}
 """
                 
-                draft_content = (await call_llm(prompt, temperature=0.2, json_mode=False)).strip()
+                content = await call_llm(prompt, temperature=0.2, json_mode=True)
+                draft_data = json.loads(content)
+                draft_content = draft_data.get("new_value", "").strip()
+                reason = draft_data.get("reason", "").strip()
+                source_provenance = draft_data.get("source_provenance", "").strip()
                 
-                # Add a brief rate-limiting sleep between section drafts
-                await asyncio.sleep(2.0)
-                
+                # Semantic Git Diff Check: Skip review if no content changes
+                if draft_content.strip() == existing_content.strip():
+                    logger.info(f"[{run_id}] Section '{section_name}' has no changes. Skipping review creation.")
+                    continue
+                    
                 # Find if there is a linked conflict for this run
-                # We can query conflicts related to the new entities
                 conflict_id = None
                 new_ent_ids = [UUID(ent["id"]) for ent in state["entities"]]
                 if new_ent_ids:
-                    conf_stmt = select(Conflict).where(Conflict.workspace_id == state["workspace_id"]).where(Conflict.new_entity_id.in_(new_ent_ids)).limit(1)
+                    conf_stmt = (
+                        select(Conflict)
+                        .where(Conflict.workspace_id == state["workspace_id"])
+                        .where(Conflict.new_entity_id.in_(new_ent_ids))
+                        .limit(1)
+                    )
                     conf_res = await db.execute(conf_stmt)
                     conf_item = conf_res.scalars().first()
                     if conf_item:
                         conflict_id = conf_item.id
-                
+                        
                 # Create a pending Review row
                 proposed_change = {
+                    "section": section_name,
                     "target_section": section_name,
+                    "operation": "add" if (not existing_content or existing_content.startswith("(This section")) else "modify",
                     "old_value": existing_content,
                     "new_value": draft_content,
+                    "reason": reason if reason else f"New details reconciled from {doc_name}",
+                    "source_provenance": source_provenance if source_provenance else doc_name,
                     "source_document": doc_name
                 }
                 
@@ -777,15 +880,23 @@ GROUNDING RULES:
                     status="pending"
                 )
                 db.add(db_review)
+                reviews_created = True
                 
-            # Set job status to waiting_for_review
-            await update_job_node(db, run_id, "generate_brief_updates", status="waiting_for_review")
+            if reviews_created:
+                # Set job status to waiting_for_review
+                await update_job_node(db, run_id, "generate_brief_updates", status="waiting_for_review")
+            else:
+                logger.info(f"[{run_id}] No changes detected in any affected sections.")
+                await update_job_node(db, run_id, "generate_brief_updates", status="complete")
+                
             await db.commit()
             
         except Exception as e:
-            logger.error(f"Error generating brief updates: {e}")
+            logger.error(f"Error in brief updates node: {e}")
             state["error"] = str(e)
             await update_job_node(db, run_id, "generate_brief_updates", status="failed", error=str(e))
+            
+    return state
             
     return state
 

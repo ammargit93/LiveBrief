@@ -175,9 +175,28 @@ To prevent users from being overwhelmed by the same logical issue multiple times
 
 ### 4. Human-In-The-Loop Review Queue
 Draft updates are never written directly to the project summary brief. Instead:
-- Proposed changes are saved as `Review` tasks.
+- proposed changes are saved as `Review` tasks.
 - Committing updates requires explicit User approval via the `/review/{id}/approve` endpoint, which increments the version of the corresponding section in `project_summary` and appends an entry to the audit timeline.
 - Citations are formatted cleanly (e.g., `Source: [Document Name · Page X]`) for strict traceability.
+
+### 5. Incremental Project Brief Updates (Semantic Git Diffs)
+To prevent unrelated brief sections from being modified by the LLM during drafting, LiveBrief implements an incremental, semantic diff-based drafting pipeline:
+- **Planner Scoping**: The Planner node evaluates the input document and identifies only the sections that are affected.
+- **Targeted Generation**: The system generates drafts **only** for these affected sections. Unaffected sections are copied directly from their latest database version without running through the LLM.
+- **Semantic Diff Verification**: If the LLM-generated draft for an affected section matches the existing section content exactly, no review task is created, preventing unnecessary versions from being checked in.
+- **Structured Diff Output**: Sections that change are classified as `add` or `modify` and stored in the review's `proposed_change` field with the following metadata:
+  - `section`: Name of the section (e.g. `Timeline`).
+  - `operation`: `add` or `modify`.
+  - `old_value`: Current section content.
+  - `new_value`: Drafted section content.
+  - `reason`: Justification explaining the change.
+  - `source_provenance`: Structured document name and pages citation.
+
+### 6. Git-like Version Control & Section Rollbacks
+Every change to a project brief section is fully versioned, allowing developer teams to review change histories and perform section rollbacks:
+- **Database Versioning**: The `project_summary` table tracks sections individually. Approving an update inserts a new row with `version = latest_version + 1` rather than overwriting in-place.
+- **Rollback API**: The `POST /project-summary/{section}/rollback?version={version_number}` endpoint fetches the target version, duplicates its content, and saves it as a new version entry while registering a `Timeline` event in the audit trail.
+- **Interactive UI Rollback**: Older versions displayed in the "History" panel show a **Rollback** action button that instantly restores the brief section to that checkpoint.
 
 ---
 
@@ -185,101 +204,7 @@ Draft updates are never written directly to the project summary brief. Instead:
 
 LiveBrief utilizes a relational schema optimized with the `pgvector` extension for semantic search capabilities:
 
-```mermaid
-erDiagram
-    Workspace ||--o{ Document : contains
-    Workspace ||--o{ ProjectSummary : has
-    Workspace ||--o{ Conflict : has
-    Workspace ||--o{ Review : has
-    Workspace ||--o{ Timeline : logs
-    Workspace ||--o{ GraphRun : tracks
-    Document ||--o{ Embedding : has
-    Document ||--o{ Entity : contains
-    
-    Workspace {
-        UUID id PK
-        String name UNIQUE
-        DateTime created_at
-    }
-    Document {
-        UUID id PK
-        UUID workspace_id FK
-        String filename
-        String storage_path
-        String type
-        Float classification_confidence
-        String status
-        Integer version
-        DateTime uploaded_at
-    }
-    Embedding {
-        UUID id PK
-        UUID document_id FK
-        Text chunk
-        Integer chunk_index
-        Vector embedding "pgvector(384)"
-    }
-    Entity {
-        UUID id PK
-        UUID document_id FK
-        String type
-        JSONB value
-        Text source_excerpt
-        Vector embedding "pgvector(384)"
-        DateTime created_at
-    }
-    Conflict {
-        UUID id PK
-        UUID workspace_id FK
-        String category
-        Text description
-        String severity
-        UUID existing_entity_id FK
-        UUID new_entity_id FK
-        Boolean resolved
-        DateTime created_at
-    }
-    ProjectSummary {
-        UUID id PK
-        UUID workspace_id FK
-        String section
-        Text content
-        Integer version
-        UUID last_review_id FK
-        DateTime updated_at
-    }
-    Review {
-        UUID id PK
-        UUID workspace_id FK
-        JSONB proposed_change
-        UUID conflict_id FK
-        String status
-        Text reason
-        DateTime created_at
-        DateTime resolved_at
-    }
-    Timeline {
-        UUID id PK
-        UUID workspace_id FK
-        String event
-        Text reason
-        String actor
-        UUID review_id FK
-        String section
-        DateTime timestamp
-    }
-    GraphRun {
-        UUID id PK
-        UUID workspace_id FK
-        UUID document_id FK
-        UUID batch_id
-        String current_node
-        String status
-        Text error
-        DateTime started_at
-        DateTime updated_at
-    }
-```
+![ER Diagram](assets/er.png)
 
 ---
 

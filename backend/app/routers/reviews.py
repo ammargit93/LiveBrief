@@ -141,6 +141,7 @@ async def update_review(
     proposed = dict(db_review.proposed_change) if db_review.proposed_change else {}
     if data.target_section is not None:
         proposed["target_section"] = data.target_section
+        proposed["section"] = data.target_section
     if data.new_value is not None:
         proposed["new_value"] = data.new_value
         
