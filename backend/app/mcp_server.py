@@ -527,11 +527,10 @@ async def resume_run(run_id: str) -> Dict[str, Any]:
         if not run:
             raise ValueError(f"GraphRun with ID {run_id} does not exist")
             
-        if run.status != "failed":
-            raise ValueError(f"Run is in status '{run.status}' and cannot be resumed (only failed runs can be resumed)")
+        if run.status not in ["failed", "interrupted/recoverable"]:
+            raise ValueError(f"Run is in status '{run.status}' and cannot be resumed (only failed or interrupted runs can be resumed)")
             
         run.status = "running"
-        run.current_node = "upload"
         run.error = None
         await db.commit()
         

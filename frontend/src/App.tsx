@@ -1124,8 +1124,8 @@ export default function App() {
                         return 'failed';
                       }
                       
-                      // If the job is running at this node
-                      if (job.status === 'running' && job.current_node === stepId) {
+                      // If the job is running or resuming at this node
+                      if ((job.status === 'running' || job.status === 'interrupted/recoverable') && job.current_node === stepId) {
                         return 'running';
                       }
                       
@@ -1160,11 +1160,12 @@ export default function App() {
                           </div>
                           <span className={`text-[9px] font-bold uppercase px-2 py-0.5 border ${
                             job.status === 'running' ? 'bg-blue-50 border-blue-200 text-blue-800 animate-pulse' :
+                            job.status === 'interrupted/recoverable' ? 'bg-amber-50 border-amber-200 text-amber-800 animate-pulse' :
                             job.status === 'failed' ? 'bg-red-50 border-red-200 text-red-800' :
                             job.status === 'waiting_for_review' ? 'bg-orange-50 border-orange-200 text-orange-850' :
                             'bg-green-50 border-green-200 text-green-800'
                           }`}>
-                            {job.status.replace(/_/g, ' ')}
+                            {job.status === 'interrupted/recoverable' ? 'Resuming after interruption' : job.status.replace(/_/g, ' ')}
                           </span>
                         </div>
 

@@ -38,13 +38,15 @@ async def call_llm(prompt: str, temperature: float = 0.0, json_mode: bool = Fals
         llm = ChatGroq(
             model=settings.GROQ_MODEL,
             groq_api_key=settings.GROQ_API_KEY,
-            temperature=temperature
+            temperature=temperature,
+            max_tokens=4096
         ).bind(response_format={"type": "json_object"})
     else:
         llm = ChatGroq(
             model=settings.GROQ_MODEL,
             groq_api_key=settings.GROQ_API_KEY,
-            temperature=temperature
+            temperature=temperature,
+            max_tokens=4096
         )
         
     for attempt in range(max_retries):
@@ -53,6 +55,24 @@ async def call_llm(prompt: str, temperature: float = 0.0, json_mode: bool = Fals
             return response.content
         except Exception as e:
             err_msg = str(e)
+            
+            # Handle Groq JSON mode validation failures by falling back to non-JSON mode
+            is_json_error = "json_validate_failed" in err_msg.lower() or "failed to generate json" in err_msg.lower()
+            if json_mode and is_json_error:
+                logger.warning("JSON mode validation failed. Retrying without JSON mode constraint...")
+                fallback_llm = ChatGroq(
+                    model=settings.GROQ_MODEL,
+                    groq_api_key=settings.GROQ_API_KEY,
+                    temperature=temperature,
+                    max_tokens=4096
+                )
+                try:
+                    response = await fallback_llm.ainvoke(prompt)
+                    return response.content
+                except Exception as fallback_err:
+                    logger.error(f"Fallback call without JSON mode failed: {fallback_err}")
+                    raise fallback_err
+                    
             is_rate_limit = "rate_limit" in err_msg.lower() or "429" in err_msg or "rate limit reached" in err_msg.lower()
             
             if is_rate_limit and attempt < max_retries - 1:
@@ -187,6 +207,110 @@ def format_entity_value(entity_type: str, value: Dict[str, Any]) -> str:
         
     return ", ".join(parts)
 
+def repair_truncated_json(s: str) -> str:
+    s = s.strip()
+    if not s:
+        return "{}"
+        
+    in_string = False
+    escape = False
+    stack = []
+    clean_chars = []
+    
+    for char in s:
+        if escape:
+            clean_chars.append(char)
+            escape = False
+            continue
+            
+        if char == '\\':
+            clean_chars.append(char)
+            escape = True
+            continue
+            
+        if char == '"':
+            in_string = not in_string
+            clean_chars.append(char)
+            continue
+            
+        if in_string:
+            clean_chars.append(char)
+            continue
+            
+        if char in ('{', '['):
+            stack.append(char)
+            clean_chars.append(char)
+        elif char in ('}', ']'):
+            if stack:
+                last = stack[-1]
+                if (char == '}' and last == '{') or (char == ']' and last == '['):
+                    stack.pop()
+            clean_chars.append(char)
+        else:
+            clean_chars.append(char)
+            
+    rebuilt = "".join(clean_chars)
+    if in_string:
+        rebuilt += '"'
+        
+    while stack:
+        last = stack.pop()
+        if last == '{':
+            rebuilt += '}'
+        elif last == '[':
+            rebuilt += ']'
+            
+    return rebuilt
+
+def parse_json_robust(text: str) -> dict:
+    text = text.strip()
+    
+    # 1. Try raw json.loads
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+        
+    # 2. Try to find markdown json code blocks: ```json ... ```
+    import re
+    match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text)
+    if match:
+        try:
+            return json.loads(match.group(1).strip())
+        except Exception:
+            pass
+            
+    # 3. Try to find the first '{' and last '}'
+    start = text.find('{')
+    end = text.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start:end+1])
+        except Exception:
+            pass
+            
+    # 4. Try to repair truncated JSON
+    cleaned = text
+    while cleaned and cleaned[-1] in (',', ':', ' ', '\t', '\n', '\r'):
+        cleaned = cleaned[:-1].strip()
+        
+    try:
+        repaired = repair_truncated_json(cleaned)
+        return json.loads(repaired)
+    except Exception:
+        pass
+        
+    # Try one more fallback by stripping after the last comma
+    try:
+        last_comma = cleaned.rfind(',')
+        if last_comma != -1:
+            repaired = repair_truncated_json(cleaned[:last_comma])
+            return json.loads(repaired)
+    except Exception:
+        pass
+
+    raise ValueError(f"Could not parse valid JSON from LLM response: {text[:200]}...")
+
 class AgentState(TypedDict):
     workspace_id: str
     document_id: str
@@ -206,7 +330,16 @@ class AgentState(TypedDict):
     planner_decision: Dict[str, Any]
 
 # Helper to log node transitions
-async def update_job_node(db: AsyncSession, run_id: str, node_name: str, status: str = "running", error: str = None, planner_decision: dict = None):
+async def update_job_node(db: AsyncSession, run_id: str, node_name: str, status: str = None, error: str = None, planner_decision: dict = None):
+    if status is None:
+        stmt = select(GraphRun.status).where(GraphRun.id == run_id)
+        res = await db.execute(stmt)
+        curr_status = res.scalar()
+        if curr_status == "interrupted/recoverable":
+            status = "interrupted/recoverable"
+        else:
+            status = "running"
+            
     values = {"current_node": node_name, "status": status, "error": error}
     if planner_decision is not None:
         values["planner_decision"] = planner_decision
@@ -257,7 +390,7 @@ JSON format:
 
         try:
             content = await call_llm(prompt, temperature=0.0, json_mode=True)
-            data = json.loads(content)
+            data = parse_json_robust(content)
             
             # Save type & confidence to DB
             stmt = (
@@ -270,6 +403,7 @@ JSON format:
                 )
             )
             await db.execute(stmt)
+            await update_job_node(db, run_id, "classification", status="complete")
             await db.commit()
             
             state["type"] = data.get("type", "Unknown")
@@ -336,7 +470,7 @@ JSON structure:
             
             # Save the decision to state and persist in DB
             state["planner_decision"] = decision.model_dump()
-            await update_job_node(db, run_id, "planner", planner_decision=decision.model_dump())
+            await update_job_node(db, run_id, "planner", status="complete", planner_decision=decision.model_dump())
             
         except Exception as e:
             logger.error(f"[{run_id}] Planner failed, falling back to full pipeline: {e}")
@@ -358,7 +492,7 @@ JSON structure:
                 reasoning=f"Planner fallback triggered due to error: {str(e)}"
             )
             state["planner_decision"] = fallback_decision.model_dump()
-            await update_job_node(db, run_id, "planner", planner_decision=fallback_decision.model_dump())
+            await update_job_node(db, run_id, "planner", status="complete", planner_decision=fallback_decision.model_dump())
             
     return state
 
@@ -370,6 +504,12 @@ async def extraction_node(state: AgentState) -> AgentState:
     
     async with async_session_maker() as db:
         await update_job_node(db, run_id, "extraction")
+        
+        # Delete existing entities and embeddings for this document_id to make extraction idempotent
+        from sqlalchemy import delete
+        await db.execute(delete(Entity).where(Entity.document_id == doc_id))
+        await db.execute(delete(Embedding).where(Embedding.document_id == doc_id))
+        await db.flush()
         
         allowed_types = state["planner_decision"].get("entity_types_to_extract", [])
         if not allowed_types:
@@ -432,7 +572,7 @@ JSON format:
 """
 
                 content = await call_llm(prompt, temperature=0.0, json_mode=True)
-                extracted_data = json.loads(content)
+                extracted_data = parse_json_robust(content)
                 
                 # Add a brief rate-limiting sleep between batches
                 await asyncio.sleep(2.0)
@@ -500,6 +640,7 @@ JSON format:
                 )
                 db.add(db_emb)
                 
+            await update_job_node(db, run_id, "extraction", status="complete")
             await db.commit()
             state["entities"] = entities_list
         except Exception as e:
@@ -560,6 +701,7 @@ async def knowledge_merge_node(state: AgentState) -> AgentState:
                     })
                             
             state["conflicts"] = conflicts_to_check
+            await update_job_node(db, run_id, "knowledge_merge", status="complete")
         except Exception as e:
             logger.error(f"Error in knowledge merge: {e}")
             state["error"] = str(e)
@@ -585,6 +727,18 @@ async def conflict_detection_node(state: AgentState) -> AgentState:
     
     async with async_session_maker() as db:
         await update_job_node(db, run_id, "conflict_detection")
+        
+        # Delete existing conflicts for this run/document to make conflict detection idempotent
+        from sqlalchemy import delete
+        doc_id = UUID(state["document_id"])
+        entity_ids_stmt = select(Entity.id).where(Entity.document_id == doc_id)
+        entity_ids_res = await db.execute(entity_ids_stmt)
+        entity_ids = entity_ids_res.scalars().all()
+        if entity_ids:
+            await db.execute(
+                delete(Conflict).where(Conflict.new_entity_id.in_(entity_ids))
+            )
+        await db.flush()
         
         candidates = state["conflicts"]
         new_entities = state["entities"]
@@ -668,7 +822,7 @@ JSON structure:
 """
                 try:
                     content = await call_llm(prompt, temperature=0.0, json_mode=True)
-                    audit_data = json.loads(content)
+                    audit_data = parse_json_robust(content)
                     audits = audit_data.get("audits", [])
                 except Exception as audit_err:
                     logger.error(f"Audit batch LLM call failed: {audit_err}")
@@ -727,6 +881,7 @@ JSON structure:
                         affected_sections.add(s)
                         
             state["sections_to_draft"] = list(affected_sections)
+            await update_job_node(db, run_id, "conflict_detection", status="complete")
             await db.commit()
             
         except Exception as e:
@@ -805,6 +960,18 @@ async def generate_brief_updates_node(state: AgentState) -> AgentState:
     
     async with async_session_maker() as db:
         await update_job_node(db, run_id, "generate_brief_updates")
+        
+        # Delete existing pending reviews for this run to make it idempotent
+        stmt = (
+            select(Review)
+            .where(Review.workspace_id == state["workspace_id"])
+            .where(Review.status == "pending")
+        )
+        res = await db.execute(stmt)
+        for r in res.scalars().all():
+            if r.proposed_change.get("run_id") == str(run_id):
+                await db.delete(r)
+        await db.flush()
         
         # 1. The Planner determines affected sections
         sections = list(set(state["planner_decision"].get("affected_sections", [])))
@@ -898,7 +1065,7 @@ You must respond with a JSON object matching this schema:
 """
                 
                 content = await call_llm(prompt, temperature=0.2, json_mode=True)
-                draft_data = json.loads(content)
+                draft_data = parse_json_robust(content)
                 raw_draft_content = draft_data.get("new_value", "").strip()
                 
                 # Format citations deterministically (deduplicated index footnote style)
@@ -936,7 +1103,9 @@ You must respond with a JSON object matching this schema:
                     "new_value": draft_content,
                     "reason": reason if reason else f"New details reconciled from {doc_name}",
                     "source_provenance": source_provenance if source_provenance else doc_name,
-                    "source_document": doc_name
+                    "source_document": doc_name,
+                    "run_id": str(run_id),
+                    "document_id": str(doc_id)
                 }
                 
                 db_review = Review(
@@ -967,6 +1136,45 @@ You must respond with a JSON object matching this schema:
     return state
 
 # Full pipeline execution helper (LangGraph-like state transition)
+# Helper to populate conflicts for state reconstruction when starting at conflict_detection
+async def populate_conflicts_in_state(db: AsyncSession, state: AgentState) -> List[Dict[str, Any]]:
+    if not state["planner_decision"].get("requires_conflict_check", True):
+        return []
+        
+    new_entities = state["entities"]
+    conflicts_to_check = []
+    
+    for new_ent in new_entities:
+        new_type = new_ent["type"]
+        identifying_text = get_entity_identifying_text(new_type, new_ent["value"])
+        new_vec = get_embedding(identifying_text)
+        
+        stmt = (
+            select(Entity)
+            .join(Document)
+            .where(Entity.document_id != UUID(state["document_id"]))
+            .where(Document.workspace_id == UUID(state["workspace_id"]))
+            .where(Entity.type == new_type)
+            .where(Entity.embedding.cosine_distance(new_vec) <= 0.60)
+            .order_by(Entity.embedding.cosine_distance(new_vec))
+        )
+        res = await db.execute(stmt)
+        matching_entities = res.scalars().all()
+        
+        for ext_ent in matching_entities:
+            conflicts_to_check.append({
+                "new_entity": new_ent,
+                "existing_entity": {
+                    "id": str(ext_ent.id),
+                    "type": ext_ent.type,
+                    "value": ext_ent.value,
+                    "source_excerpt": ext_ent.source_excerpt,
+                    "document_id": str(ext_ent.document_id)
+                }
+            })
+            
+    return conflicts_to_check
+
 async def run_agent_pipeline(run_id: str):
     logger.info(f"Starting agent pipeline execution for run_id: {run_id}")
     
@@ -997,7 +1205,40 @@ async def run_agent_pipeline(run_id: str):
             await db.merge(doc)
             await update_job_node(db, run_id, "upload", status="failed", error=f"Parsing error: {e}")
         return
-        
+
+    # Determine starting node
+    node_sequence = [
+        "upload",
+        "classification",
+        "planner",
+        "extraction",
+        "knowledge_merge",
+        "conflict_detection",
+        "generate_brief_updates",
+    ]
+    
+    current_node = run.current_node
+    current_status = run.status
+    
+    if current_node not in node_sequence:
+        start_node = "classification"
+    else:
+        node_idx = node_sequence.index(current_node)
+        if current_status in ["complete", "waiting_for_review"]:
+            if node_idx + 1 < len(node_sequence):
+                start_node = node_sequence[node_idx + 1]
+            else:
+                logger.info(f"[{run_id}] Run is already completed/waiting_for_review. Skipping execution.")
+                return
+        else:
+            start_node = current_node
+            
+    if start_node == "upload":
+        start_node = "classification"
+
+    logger.info(f"[{run_id}] Resuming/Starting pipeline from node: {start_node}")
+
+    # Build initial state
     state: AgentState = {
         "workspace_id": str(run.workspace_id),
         "document_id": str(doc.id),
@@ -1007,41 +1248,72 @@ async def run_agent_pipeline(run_id: str):
         "filename": doc.filename,
         "content": content,
         "chunks": chunks,
-        "type": "Unknown",
-        "confidence": 0.0,
+        "type": doc.type or "Unknown",
+        "confidence": doc.classification_confidence or 0.0,
         "reasoning": "",
         "entities": [],
         "conflicts": [],
         "sections_to_draft": [],
         "error": "",
-        "planner_decision": {}
+        "planner_decision": run.planner_decision or {}
     }
-    
-    # Execute node state transitions
-    state = await classification_node(state)
-    if state.get("error"):
-        return
-        
-    state = await planner_node(state)
-    if state.get("error"):
-        return
-        
-    state = await extraction_node(state)
-    if state.get("error"):
-        return
-        
-    state = await knowledge_merge_node(state)
-    if state.get("error"):
-        return
-        
-    state = await conflict_detection_node(state)
-    if state.get("error"):
-        return
-        
-    state = await generate_brief_updates_node(state)
-    if state.get("error"):
-        return
-        
+
+    # Load entities/conflicts if we are starting at/after knowledge_merge
+    if start_node in ["knowledge_merge", "conflict_detection", "generate_brief_updates"]:
+        async with async_session_maker() as db:
+            ent_stmt = select(Entity).where(Entity.document_id == doc.id)
+            ent_res = await db.execute(ent_stmt)
+            db_entities = ent_res.scalars().all()
+            state["entities"] = [
+                {
+                    "id": str(ent.id),
+                    "document_id": str(ent.document_id),
+                    "type": ent.type,
+                    "value": ent.value,
+                    "source_excerpt": ent.source_excerpt
+                }
+                for ent in db_entities
+            ]
+            
+            if start_node == "conflict_detection":
+                state["conflicts"] = await populate_conflicts_in_state(db, state)
+
+    # Execute node state transitions starting from start_node
+    if start_node == "classification":
+        state = await classification_node(state)
+        if state.get("error"):
+            return
+        start_node = "planner"
+
+    if start_node == "planner":
+        state = await planner_node(state)
+        if state.get("error"):
+            return
+        start_node = "extraction"
+
+    if start_node == "extraction":
+        state = await extraction_node(state)
+        if state.get("error"):
+            return
+        start_node = "knowledge_merge"
+
+    if start_node == "knowledge_merge":
+        state = await knowledge_merge_node(state)
+        if state.get("error"):
+            return
+        start_node = "conflict_detection"
+
+    if start_node == "conflict_detection":
+        state = await conflict_detection_node(state)
+        if state.get("error"):
+            return
+        start_node = "generate_brief_updates"
+
+    if start_node == "generate_brief_updates":
+        state = await generate_brief_updates_node(state)
+        if state.get("error"):
+            return
+
     # Mark document status as complete
     async with async_session_maker() as db:
         stmt = (
@@ -1052,4 +1324,4 @@ async def run_agent_pipeline(run_id: str):
         await db.execute(stmt)
         await db.commit()
         
-    logger.info(f"[{run_id}] Finished processing up to interrupt stage successfully.")
+    logger.info(f"[{run_id}] Finished processing pipeline successfully.")

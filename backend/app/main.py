@@ -34,6 +34,30 @@ async def lifespan(app: FastAPI):
             logger.info("Seeding Default Workspace with initial sections...")
             await create_workspace_with_sections("Default Workspace", db)
             await db.commit()
+            
+    # Startup recovery mechanism for incomplete pipeline runs
+    try:
+        import asyncio
+        from sqlalchemy import or_
+        from backend.app.models import GraphRun
+        from backend.app.services.agent_service import run_agent_pipeline
+        
+        async with async_session_maker() as db:
+            stmt = select(GraphRun).where(or_(GraphRun.status == "running", GraphRun.status == "interrupted/recoverable"))
+            res = await db.execute(stmt)
+            incomplete_runs = res.scalars().all()
+            
+            if incomplete_runs:
+                logger.info(f"Startup recovery: Found {len(incomplete_runs)} incomplete runs to recover.")
+                for run in incomplete_runs:
+                    logger.info(f"Recovering GraphRun {run.id} (node: {run.current_node}, status: {run.status})")
+                    run.status = "interrupted/recoverable"
+                    run.error = "Interrupted due to backend restart."
+                    asyncio.create_task(run_agent_pipeline(str(run.id)))
+                await db.commit()
+    except Exception as recovery_err:
+        logger.error(f"Startup recovery failed: {recovery_err}")
+        
     yield
 
 app = FastAPI(
