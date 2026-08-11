@@ -77,65 +77,70 @@ backend/app/
 
 ---
 
-## 🧬 Agentic Pipeline Workflow
+## ⚙️ Design Decisions, Architecture Choices & Trade-offs
 
-When a file is uploaded, a background task initiates a resumable state-transition pipeline through five distinct nodes (implemented as a LangGraph-like state flow):
+LiveBrief is designed around a checkpoint-driven, modular pipeline where document ingestion runs as a background task. This section covers the architectural choices, trade-offs, system behavior on failures, and domain/format coverage.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor User
-    participant Router as API Router
-    participant Agent as Agent Service
-    participant DB as PostgreSQL
-    participant LLM as Chat LLM
+### 🏛️ Component Architecture & Reason for Choice
+We chose a **modular linear agent pipeline** over an orchestrator loop or generic graph library:
+- **Atomic Node Duties**: Each stage (`classification`, `planner`, `extraction`, `knowledge_merge`, `conflict_detection`, `generate_brief_updates`) is implemented as an atomic async function in [agent_service.py](file:///c:/Projects/Python-projects/LiveBrief/backend/app/services/agent_service.py).
+- **Persistent Database Checkpoints**: The database stores the run's `current_node` and execution `status`.
+- **Reason for Choice**: It isolates complexity, makes tracing LLM calls straightforward, and allows us to implement node-level resumption without re-running the entire ingestion process if a step is interrupted or fails.
 
-    User->>Router: Upload Document
-    Router->>Agent: Run Agent Pipeline
-    activate Agent
-    
-    rect rgb(240, 240, 240)
-        note right of Agent: Node 1: Classification
-        Agent->>LLM: Classify (First 3k chars)
-        LLM-->>Agent: Type & Confidence JSON
-        Agent->>DB: Update Document status & type
-    end
+---
 
-    rect rgb(230, 240, 250)
-        note right of Agent: Node 2: Information Extraction
-        Agent->>Agent: Parse & Chunk Content
-        Agent->>LLM: Extract structured facts
-        LLM-->>Agent: Features, Decisions, Milestones, Owners
-        Agent->>Agent: Generate identifying text embeddings
-        Agent->>DB: Save Entities & Chunks
-    end
+### ⚖️ Cost vs. Benefit Analysis (Trade-offs)
 
-    rect rgb(220, 240, 240)
-        note right of Agent: Node 3: Knowledge Merge
-        Agent->>DB: Query similar active entities in workspace (cosine similarity >= 0.40)
-        DB-->>Agent: Matching existing entities
-    end
+#### 1. Latency
+- **What it buys us**: The Planner node scopes down the work by selecting only the affected brief sections. This prevents the system from re-drafting all sections, making the final drafting step significantly faster. Additionally, classification runs on only the first 3,000 characters, resolving doc type in milliseconds.
+- **What it costs us**: The sequential execution of up to 6 distinct nodes (with LLM and embedding calls in each) creates a longer total execution path (20-40 seconds). Since this runs asynchronously in background tasks, it does not block the user API response.
 
-    rect rgb(240, 240, 230)
-        note right of Agent: Node 4: Conflict Detection
-        Agent->>LLM: Compare matched pairs for contradictions
-        LLM-->>Agent: Audit Results (Conflict status, explanation)
-        Agent->>Agent: Deduplicate equivalent conflicts in batch
-        Agent->>DB: Save detected Conflicts
-    end
+#### 2. Money & API Token Optimization
+- **What it buys us**: Scoping LLM generation strictly to affected sections and using a local, open-source sentence embedding model (`all-MiniLM-L6-v2`) keeps token costs extremely low. 
+- **What it costs us**: Running multiple semantic audits and entity extraction batches requires multiple Groq API calls. If the model outputs very large payloads, it can hit rate limits on free-tier API keys. We resolved this by implementing rate-limit retries with backoff and setting a high `max_tokens=4096` limit.
 
-    rect rgb(240, 230, 240)
-        note right of Agent: Node 5: Brief Drafting
-        Agent->>DB: Fetch all active entities for affected sections
-        Agent->>LLM: Draft updated Markdown content (Grounding/Citations)
-        LLM-->>Agent: Section Draft Markdown
-        Agent->>DB: Create Review Task (Status: pending)
-    end
+#### 3. Simplicity
+- **What it buys us**: A standard Python async workflow utilizing pure SQLAlchemy transactions is simple to understand, deploy, and debug. There is no need for external agent runtimes or graph databases.
+- **What it costs us**: We had to build custom in-memory reconstruction logic and database serialization handlers to restore state correctly when resuming from a middle step.
 
-    Agent-->>Router: Job Pending Review
-    deactivate Agent
-    Router-->>User: Success response (Waiting for review)
-```
+#### 4. Room to Grow
+- **What it buys us**: Clean node inputs and outputs make it trivial to plug in additional analysis steps (e.g., security checks, cost estimation, compliance checking) without modifying the existing architecture.
+- **What it costs us**: Large-scale production deployments processing thousands of documents concurrently will need a robust task broker like Celery or RQ instead of FastAPI's lightweight `BackgroundTasks`.
+
+---
+
+### 🛡️ Behavior Under Failures & Recovery
+
+#### 1. How the System Behaves When a Step Fails
+- **Node Exception**: If an LLM call fails, the database connection drops, or validation errors occur during a node execution, the error is caught, saved to the `GraphRun.error` field, and the run is marked as `"failed"`.
+- **Manual Resumption**: Using the `resume_run` tool, you can resume failed runs. The pipeline reads the failure checkpoint from the database and runs the failed node again—**completely skipping prior nodes** that already successfully completed.
+
+#### 2. Container/Process Interruption (Killed Backend)
+- **Automatic Recovery on Startup**: If the backend container or process is terminated mid-run, the database status remains `"running"`. On backend startup, the FastAPI `lifespan` manager detects incomplete runs, transitions them to `"interrupted/recoverable"`, and automatically queues background tasks to resume them.
+- **Idempotency Protection (Working the Second Time)**: Running the pipeline a second time or resuming mid-way is guaranteed not to duplicate records or corrupt workspace state because each node deletes previously generated records before executing its logic:
+  - `extraction` deletes existing document entities and chunk embeddings.
+  - `conflict_detection` deletes existing conflicts associated with the document's entities.
+  - `generate_brief_updates` deletes previously created pending reviews for that run.
+
+---
+
+### 📂 Declared Formats & Domains
+
+#### Supported Document Formats
+LiveBrief supports parsing and processing the following document types:
+- **Markdown (`.md`)**
+- **Portable Document Format (`.pdf`)**
+- **Microsoft Word (`.docx`)**
+
+#### Supported Domains
+The system is built specifically for **Software Engineering & Project Management** documents. It expects and successfully processes:
+- Product Requirement Documents (PRDs)
+- Architecture & System Designs
+- Architecture Decision Records (ADRs)
+- Meeting Notes & Action Items
+- Sprint Planning & Backlog Specs
+- Release Notes & Changelogs
+- API Specifications
 
 ---
 
