@@ -28,7 +28,7 @@ async def get_project_summary(
 
 @router.get("/export")
 async def export_project_summary(
-    format: str = Query("pdf", regex="^(pdf|docx)$"),
+    format: str = Query("pdf", pattern="^(pdf|docx)$"),
     workspace_id: uuid.UUID = Depends(get_active_workspace_id),
     db: AsyncSession = Depends(get_db)
 ):

@@ -2,7 +2,7 @@ import asyncio
 import sys
 import sqlalchemy as sa
 from backend.app.core.database import engine, Base
-from backend.app.models import * # Import all models to register them with metadata
+from backend.app.models import *
 
 async def init_models():
     print("Initializing database tables...")
