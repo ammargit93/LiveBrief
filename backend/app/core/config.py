@@ -3,15 +3,9 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    DATABASE_URL: str = os.environ.get(
-        "DATABASE_URL", 
-        "postgresql+asyncpg://neondb_owner:npg_f5eoYQgrZ1jy@ep-holy-scene-b3d5pgxv-pooler.c-4.ap-southeast-1.aws.neon.tech/neondb?ssl=require"
-    )
+    DATABASE_URL: str = os.environ.get("DATABASE_URL")
     
-    SYNC_DATABASE_URL: str = os.environ.get(
-        "SYNC_DATABASE_URL",
-        "postgresql://neondb_owner:npg_f5eoYQgrZ1jy@ep-holy-scene-b3d5pgxv-pooler.c-4.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-    )
+    SYNC_DATABASE_URL: str = os.environ.get("SYNC_DATABASE_URL")
 
     @field_validator("DATABASE_URL")
     @classmethod
