@@ -101,9 +101,6 @@ export default function App() {
   const [rejectReason, setRejectReason] = useState<string>('');
   const [showRejectModal, setShowRejectModal] = useState<string | null>(null);
   
-  const [expandedHistorySection, setExpandedHistorySection] = useState<string | null>(null);
-  const [sectionHistoryData, setSectionHistoryData] = useState<any[]>([]);
-
   const [showWorkspaceModal, setShowWorkspaceModal] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState('');
 
@@ -276,48 +273,6 @@ export default function App() {
       }
     } catch (e) {
       alert(`Error creating workspace: ${e}`);
-    }
-  };
-
-  const handleToggleHistory = async (sectionName: string) => {
-    if (expandedHistorySection === sectionName) {
-      setExpandedHistorySection(null);
-      setSectionHistoryData([]);
-    } else {
-      setExpandedHistorySection(sectionName);
-      try {
-        const res = await fetch(`${API_BASE}/project-summary/${encodeURIComponent(sectionName)}/history?workspace_id=${activeWorkspaceId}`);
-        if (res.ok) {
-          const data = await res.json();
-          setSectionHistoryData(data);
-        }
-      } catch (e) {
-        console.error("Error fetching history:", e);
-      }
-    }
-  };
-
-  const handleRollbackSection = async (sectionName: string, versionNumber: number) => {
-    if (!activeWorkspaceId) return;
-    if (!window.confirm(`Are you sure you want to rollback "${sectionName}" to version ${versionNumber}?`)) return;
-    
-    try {
-      const res = await fetch(`${API_BASE}/project-summary/${encodeURIComponent(sectionName)}/rollback?version=${versionNumber}&workspace_id=${activeWorkspaceId}`, {
-        method: 'POST'
-      });
-      if (res.ok) {
-        fetchWorkspaceData(activeWorkspaceId);
-        const histRes = await fetch(`${API_BASE}/project-summary/${encodeURIComponent(sectionName)}/history?workspace_id=${activeWorkspaceId}`);
-        if (histRes.ok) {
-          const histData = await histRes.json();
-          setSectionHistoryData(histData);
-        }
-      } else {
-        const err = await res.json();
-        alert(`Rollback failed: ${err.detail || 'Error'}`);
-      }
-    } catch (e) {
-      alert(`Error during rollback: ${e}`);
     }
   };
 
@@ -618,9 +573,6 @@ export default function App() {
                       className="flex items-center justify-between px-2 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 hover:text-slate-900 border-b border-slate-100 last:border-0"
                     >
                       <span>{sec.section}</span>
-                      <span className="text-[9px] bg-slate-100 border border-slate-200 px-1 py-0.2 rounded-none font-mono">
-                        v{sec.version}
-                      </span>
                     </a>
                   ))}
                 </div>
@@ -643,59 +595,13 @@ export default function App() {
                     <div className="flex justify-between items-center mb-3 border-b border-slate-200 pb-2">
                       <h3 className="text-sm font-bold text-slate-900 uppercase tracking-wide">{sec.section}</h3>
                       <div className="flex items-center gap-2 text-[10px] text-slate-500 font-medium">
-                        <span>Version {sec.version}</span>
-                        <span>&bull;</span>
                         <span>Updated {new Date(sec.updated_at).toLocaleDateString()}</span>
-                        <span>&bull;</span>
-                        <button 
-                          onClick={() => handleToggleHistory(sec.section)}
-                          className="text-[10px] text-indigo-600 hover:text-indigo-800 font-semibold cursor-pointer underline flex items-center gap-0.5"
-                        >
-                          <Clock className="h-3 w-3" /> History
-                        </button>
                       </div>
                     </div>
 
                     <div className="prose prose-slate max-w-none text-slate-800">
                       {renderMarkdown(sec.content)}
                     </div>
-
-                    {/* Version History Drawer */}
-                    {expandedHistorySection === sec.section && (
-                      <div className="mt-4 border-t border-slate-200 pt-4 space-y-3">
-                        <h4 className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider">Version History ({sectionHistoryData.length})</h4>
-                        <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
-                          {sectionHistoryData.map((hist) => (
-                            <div key={hist.id} className="p-3 bg-slate-50 border border-slate-200 rounded-none space-y-1.5">
-                              <div className="flex justify-between items-center text-[10px]">
-                                <div className="flex items-center gap-2">
-                                  <span className="font-semibold text-slate-800">
-                                    Version {hist.version} 
-                                  </span>
-                                  {hist.version === sec.version ? (
-                                    <span className="text-[8px] bg-slate-200 border border-slate-300 text-slate-800 px-1 py-0.2 uppercase font-bold">
-                                      Current
-                                    </span>
-                                  ) : (
-                                    <button
-                                      onClick={() => handleRollbackSection(sec.section, hist.version)}
-                                      className="text-[9px] text-indigo-600 hover:text-indigo-800 font-bold uppercase tracking-wider cursor-pointer border border-indigo-200 hover:border-indigo-400 bg-white px-1.5 py-0.2 transition-all"
-                                    >
-                                      Rollback
-                                    </button>
-                                  )}
-                                </div>
-                                <span className="text-slate-500 font-mono text-[9px]">{new Date(hist.updated_at).toLocaleString()}</span>
-                              </div>
-                              
-                              <div className="text-[11px] text-slate-600 whitespace-pre-wrap font-mono bg-white p-2 border border-slate-200">
-                                {hist.content}
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
                   </div>
                 ))
               )}
@@ -1035,7 +941,6 @@ export default function App() {
                     <thead className="text-[10px] uppercase text-slate-400 border-b border-slate-200 bg-slate-50">
                       <tr>
                         <th className="px-4 py-3">Filename</th>
-                        <th className="px-4 py-3">Logical Version</th>
                         <th className="px-4 py-3">Classified Type</th>
                         <th className="px-4 py-3">Confidence</th>
                         <th className="px-4 py-3">Ingestion State</th>
@@ -1053,7 +958,6 @@ export default function App() {
                               {doc.filename}
                             </span>
                           </td>
-                          <td className="px-4 py-3 font-mono text-[10px]">v{doc.version}</td>
                           <td className="px-4 py-3">{doc.type || 'Unknown'}</td>
                           <td className="px-4 py-3 font-mono text-[10px]">
                             {doc.classification_confidence !== null ? `${(doc.classification_confidence * 100).toFixed(0)}%` : 'N/A'}
@@ -1442,7 +1346,7 @@ export default function App() {
               <div>
                 <h3 className="text-sm font-bold text-slate-900 font-mono tracking-tight">{viewingDoc.filename}</h3>
                 <p className="text-[10px] text-slate-400 mt-0.5">
-                  Type: <span className="font-semibold">{viewingDoc.type || 'Unknown'}</span> | Version: <span className="font-semibold">v{viewingDoc.version}</span>
+                  Type: <span className="font-semibold">{viewingDoc.type || 'Unknown'}</span>
                 </p>
               </div>
               <div className="flex items-center gap-3">

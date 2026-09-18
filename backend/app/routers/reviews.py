@@ -48,26 +48,28 @@ async def approve_review(
     new_value = proposed.get("new_value")
     source_doc = proposed.get("source_document")
     
-    # Fetch current version number in this workspace
+    # Fetch current section in this workspace
     stmt = (
         select(ProjectSummary)
         .where(ProjectSummary.workspace_id == workspace_id)
         .where(ProjectSummary.section == section_name)
-        .order_by(desc(ProjectSummary.version))
     )
     res = await db.execute(stmt)
     db_sec = res.scalars().first()
-    latest_version = db_sec.version if db_sec else 0
     
-    new_sec = ProjectSummary(
-        workspace_id=workspace_id,
-        section=section_name,
-        content=new_value,
-        version=latest_version + 1,
-        last_review_id=db_review.id,
-        updated_at=datetime.utcnow()
-    )
-    db.add(new_sec)
+    if db_sec:
+        db_sec.content = new_value
+        db_sec.last_review_id = db_review.id
+        db_sec.updated_at = datetime.utcnow()
+    else:
+        new_sec = ProjectSummary(
+            workspace_id=workspace_id,
+            section=section_name,
+            content=new_value,
+            last_review_id=db_review.id,
+            updated_at=datetime.utcnow()
+        )
+        db.add(new_sec)
         
     db_review.status = "approved"
     db_review.resolved_at = datetime.utcnow()

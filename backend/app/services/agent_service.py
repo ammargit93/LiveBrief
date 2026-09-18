@@ -425,7 +425,12 @@ async def planner_node(state: AgentState) -> AgentState:
         await update_job_node(db, run_id, "planner")
         
         # 1. Fetch existing project brief section metadata for context
-        stmt = select(ProjectSummary).where(ProjectSummary.workspace_id == state["workspace_id"]).order_by(ProjectSummary.section)
+        stmt = (
+            select(ProjectSummary)
+            .where(ProjectSummary.workspace_id == state["workspace_id"])
+            .distinct(ProjectSummary.section)
+            .order_by(ProjectSummary.section, desc(ProjectSummary.updated_at))
+        )
         res = await db.execute(stmt)
         summaries = res.scalars().all()
         
@@ -778,7 +783,6 @@ For each pair, determine:
 
 Do NOT flag the following as conflicts (set "conflict": false):
 * WebSocket chosen vs long polling rejected: Choices to use one technology and reject/not use another (e.g. Record A chooses WebSocket, Record B rejects long polling) are compatible decisions.
-* Core v1 feature vs deferred feature: Different features scheduled for different versions/releases (e.g., Feature X in v1, Feature Y deferred to v1.1) are NOT conflicts. Only flag a conflict if the EXACT SAME feature has conflicting milestones.
 * Missing information: One record mentioning a constraint or detail while the other does not mention it is NOT a conflict. Absence of a claim must never be interpreted as contradiction.
 * Different milestones: Distinct chronological milestones (e.g., Internal Alpha Apr 10, Closed Beta May 1, Public Beta July 1) are consistent. Only flag dates as conflicting if they specify different dates for the EXACT SAME milestone.
 * Different tasks: Different owners or dates are fine for different tasks. Only flag a conflict after confirming the underlying task is the exact same.
@@ -992,12 +996,11 @@ async def generate_brief_updates_node(state: AgentState) -> AgentState:
             reviews_created = False
             
             for section_name in sections:
-                # Fetch the latest version row of this section to get current content
+                # Fetch the current content of this section
                 stmt = (
                     select(ProjectSummary)
                     .where(ProjectSummary.workspace_id == state["workspace_id"])
                     .where(ProjectSummary.section == section_name)
-                    .order_by(desc(ProjectSummary.version))
                 )
                 res = await db.execute(stmt)
                 summary_section = res.scalars().first()
@@ -1118,7 +1121,6 @@ You must respond with a JSON object matching this schema:
                 reviews_created = True
                 
             if reviews_created:
-                # Set job status to waiting_for_review
                 await update_job_node(db, run_id, "generate_brief_updates", status="waiting_for_review")
             else:
                 logger.info(f"[{run_id}] No changes detected in any affected sections.")

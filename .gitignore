@@ -16,5 +16,4 @@ docs
 backend/tests
 
 backend/alembic
-backend/alembic.ini
 backend/uploads

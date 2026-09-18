@@ -25,8 +25,7 @@ async def create_workspace_with_sections(name: str, db: AsyncSession) -> Workspa
         db_sec = ProjectSummary(
             workspace_id=ws.id,
             section=sec,
-            content=f"Initial empty template for {sec}.",
-            version=1
+            content=f"Initial empty template for {sec}."
         )
         db.add(db_sec)
     return ws

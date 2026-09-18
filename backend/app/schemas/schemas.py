@@ -11,7 +11,6 @@ class DocumentResponse(BaseModel):
     classification_confidence: Optional[float]
     status: str
     uploaded_at: datetime
-    version: int
 
     class Config:
         from_attributes = True
@@ -33,7 +32,6 @@ class ProjectSummaryResponse(BaseModel):
     id: UUID
     section: str
     content: str
-    version: int
     updated_at: datetime
     last_review_id: Optional[UUID]
 

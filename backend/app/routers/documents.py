@@ -43,23 +43,11 @@ async def upload_documents(
             logger.error(f"Failed to save file {filename}: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to write file: {e}")
             
-        # Versioning: check if filename exists in this workspace
-        stmt = (
-            select(Document)
-            .where(Document.workspace_id == workspace_id)
-            .where(Document.filename == filename)
-            .order_by(desc(Document.version))
-        )
-        res = await db.execute(stmt)
-        latest_doc = res.scalars().first()
-        version = (latest_doc.version + 1) if latest_doc else 1
-        
         db_doc = Document(
             workspace_id=workspace_id,
             filename=filename,
             storage_path=storage_path,
-            status="needs_classification",
-            version=version
+            status="needs_classification"
         )
         db.add(db_doc)
         await db.flush() # Populate DB ID
@@ -81,7 +69,7 @@ async def upload_documents(
         db_timeline = Timeline(
             workspace_id=workspace_id,
             event="Document uploaded",
-            reason=f"File '{filename}' (v{version}) uploaded to storage.",
+            reason=f"File '{filename}' uploaded to storage.",
             actor="user:uploaded",
             section="Ingestion"
         )

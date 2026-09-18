@@ -197,11 +197,10 @@ To prevent unrelated brief sections from being modified by the LLM during drafti
   - `reason`: Justification explaining the change.
   - `source_provenance`: Structured document name and pages citation.
 
-### 6. Git-like Version Control & Section Rollbacks
-Every change to a project brief section is fully versioned, allowing developer teams to review change histories and perform section rollbacks:
-- **Database Versioning**: The `project_summary` table tracks sections individually. Approving an update inserts a new row with `version = latest_version + 1` rather than overwriting in-place.
-- **Rollback API**: The `POST /project-summary/{section}/rollback?version={version_number}` endpoint fetches the target version, duplicates its content, and saves it as a new version entry while registering a `Timeline` event in the audit trail.
-- **Interactive UI Rollback**: Older versions displayed in the "History" panel show a **Rollback** action button that instantly restores the brief section to that checkpoint.
+### 6. In-Place Brief Updates & Timeline Audit Trail
+Every update to a project brief section is tracked in the system audit trail:
+- **In-Place Section Updates**: When a proposed update is approved in the review dashboard, the target section in `project_summary` is updated directly in-place with timestamp tracking (`updated_at`) and review linkage (`last_review_id`).
+- **Audit Trail & Timeline**: Every brief modification, document ingestion, and decision resolution is logged as a distinct `Timeline` event, providing complete traceability and provenance across the lifecycle of the project.
 
 ---
 

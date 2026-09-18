@@ -25,7 +25,6 @@ class Document(Base):
     classification_confidence = Column(Float, nullable=True)
     status = Column(String(50), nullable=False, default="processing")
     uploaded_at = Column(DateTime, default=datetime.utcnow)
-    version = Column(Integer, default=1)
 
     embeddings = relationship("Embedding", back_populates="document", cascade="all, delete-orphan")
     entities = relationship("Entity", back_populates="document", cascade="all, delete-orphan")
@@ -78,9 +77,12 @@ class ProjectSummary(Base):
     workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
     section = Column(String(100), nullable=False)
     content = Column(Text, nullable=False)
-    version = Column(Integer, default=1)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_review_id = Column(UUID(as_uuid=True), ForeignKey("reviews.id", ondelete="SET NULL"), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "section", name="uq_workspace_section"),
+    )
 
 class Review(Base):
     __tablename__ = "reviews"
