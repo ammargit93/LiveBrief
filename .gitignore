@@ -18,3 +18,4 @@ backend/tests
 backend/alembic
 backend/uploads
 .aider*
+/chroma_db
