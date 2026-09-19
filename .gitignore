@@ -17,3 +17,4 @@ backend/tests
 
 backend/alembic
 backend/uploads
+.aider*
